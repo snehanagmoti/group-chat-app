@@ -4,3 +4,4 @@ python-dotenv
 python-multipart
 cryptography
 bcrypt
+redis>=5.0
