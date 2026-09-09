@@ -30,7 +30,7 @@ import bcrypt
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 
 # cryptography library — ECDSA verification
 from cryptography.hazmat.primitives.asymmetric.ec import (
@@ -271,10 +271,49 @@ class CreateRoomRequest(BaseModel):
     avatar:     str = "🏰"
     created_by: str = ""
 
+class MessageRequest(BaseModel):
+    client_name: str = Field(alias="client-name")
+    msg: str
+    msg_id: str = ""   # optional — if provided by client, used for dedup; else server generates
+
+    model_config = ConfigDict(populate_by_name=True)
+
 @app.on_event("startup")
 async def startup():
-    """Initialise the SQLite database on server start."""
-    db.init_db()
+    db.init_db()   # now: pings Valkey, creates room "loadtest" if not exists
+
+
+# ── Load Balancer / Evaluator Endpoints ────────────────────────────────────────
+
+@app.post("/message")
+async def submit_message(req: MessageRequest):
+    """
+    Official load-generator endpoint.
+    Stores a plain-text message in the shared Valkey store.
+    Uses client-provided msg_id if present (enables dedup on retry),
+    otherwise server generates a UUID4.
+    Returns {"status": "ok", "msg_id": "<uuid>"} or {"status": "duplicate"}.
+    """
+    msg_id = req.msg_id.strip() if req.msg_id.strip() else str(uuid.uuid4())
+    saved = db.save_message_simple(
+        msg_id=msg_id,
+        room_id="loadtest",
+        username=req.client_name,
+        text=req.msg,
+    )
+    if saved:
+        return {"status": "ok", "msg_id": msg_id}
+    return {"status": "duplicate", "msg_id": msg_id}
+
+
+@app.get("/feed")
+async def get_feed():
+    """
+    Official load-generator endpoint.
+    Returns all messages in the global loadtest room, chronological order.
+    Shape: [{"msg_id": ..., "client-name": ..., "msg": ..., "timestamp": ...}, ...]
+    """
+    return db.get_all_messages_simple(room_id="loadtest")
 
 
 @app.get("/config.js")
@@ -311,7 +350,7 @@ async def register(req: RegisterRequest):
 
     try:
         db.create_user(username, pw_hash, avatar)
-    except sqlite3.IntegrityError:
+    except (sqlite3.IntegrityError, Exception):
         print(f"\033[91m[REGISTER ERROR] ❌ Registration failed: Username '@{username}' is already taken.\033[0m")
         raise HTTPException(status_code=409, detail=f"Username '{username}' is already taken.")
 

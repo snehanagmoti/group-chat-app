@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -21,9 +22,41 @@ import (
 // ─── Backend ──────────────────────────────────────────────────────────────────
 
 type Backend struct {
-	URL      *url.URL
-	Alive    atomic.Bool
-	InFlight atomic.Int64
+	URL        *url.URL
+	Alive      atomic.Bool
+	InFlight   atomic.Int64
+	Overloaded atomic.Bool // true when EWMA > thresholdMs
+
+	ewmaMu sync.Mutex
+	ewmaMs float64 // exponential weighted moving average latency in ms
+}
+
+func (b *Backend) recordLatency(d time.Duration, alpha, thresholdMs float64) {
+	b.ewmaMu.Lock()
+	defer b.ewmaMu.Unlock()
+	ms := float64(d.Milliseconds())
+	if b.ewmaMs == 0 {
+		b.ewmaMs = ms
+	} else {
+		b.ewmaMs = alpha*ms + (1-alpha)*b.ewmaMs
+	}
+	b.Overloaded.Store(b.ewmaMs > thresholdMs)
+}
+
+func (b *Backend) score() float64 {
+	b.ewmaMu.Lock()
+	ewma := b.ewmaMs
+	b.ewmaMu.Unlock()
+	if ewma == 0 {
+		ewma = 1
+	}
+	return float64(b.InFlight.Load()+1) * ewma
+}
+
+func (b *Backend) getEWMA() float64 {
+	b.ewmaMu.Lock()
+	defer b.ewmaMu.Unlock()
+	return b.ewmaMs
 }
 
 // ─── Metrics ──────────────────────────────────────────────────────────────────
@@ -41,22 +74,43 @@ type Metrics struct {
 // ─── LoadBalancer ─────────────────────────────────────────────────────────────
 
 type LoadBalancer struct {
-	backends []*Backend
-	next     atomic.Uint64
-	metrics  Metrics
-	timeout  time.Duration
+	backends    []*Backend
+	metrics     Metrics
+	timeout     time.Duration
+	thresholdMs float64
+	ewmaAlpha   float64
 }
 
-func (lb *LoadBalancer) nextBackend() *Backend {
-	n := len(lb.backends)
-	for i := 0; i < n; i++ {
-		index := lb.next.Add(1) % uint64(n)
-		b := lb.backends[index]
-		if b.Alive.Load() {
-			return b
+func (lb *LoadBalancer) bestBackend() *Backend {
+	var best *Backend
+	bestScore := math.MaxFloat64
+
+	// Pass 1: prefer non-overloaded, alive backends
+	for _, b := range lb.backends {
+		if !b.Alive.Load() || b.Overloaded.Load() {
+			continue
+		}
+		if s := b.score(); s < bestScore {
+			bestScore = s
+			best = b
 		}
 	}
-	return nil
+	if best != nil {
+		return best
+	}
+
+	// Pass 2: all healthy backends are overloaded — pick least in-flight alive one
+	var minFlight int64 = math.MaxInt64
+	for _, b := range lb.backends {
+		if !b.Alive.Load() {
+			continue
+		}
+		if f := b.InFlight.Load(); f < minFlight {
+			minFlight = f
+			best = b
+		}
+	}
+	return best // nil only if ALL backends are dead
 }
 
 func (lb *LoadBalancer) healthLoop(interval time.Duration) {
@@ -101,16 +155,20 @@ func (lb *LoadBalancer) healthHandler(w http.ResponseWriter, r *http.Request) {
 // statusHandler: GET /lb/status
 func (lb *LoadBalancer) statusHandler(w http.ResponseWriter, r *http.Request) {
 	type entry struct {
-		URL      string `json:"url"`
-		Alive    bool   `json:"alive"`
-		InFlight int64  `json:"in_flight"`
+		URL        string  `json:"url"`
+		Alive      bool    `json:"alive"`
+		InFlight   int64   `json:"in_flight"`
+		Overloaded bool    `json:"overloaded"`
+		EWMAMs     float64 `json:"ewma_ms"`
 	}
 	var list []entry
 	for _, b := range lb.backends {
 		list = append(list, entry{
-			URL:      b.URL.String(),
-			Alive:    b.Alive.Load(),
-			InFlight: b.InFlight.Load(),
+			URL:        b.URL.String(),
+			Alive:      b.Alive.Load(),
+			InFlight:   b.InFlight.Load(),
+			Overloaded: b.Overloaded.Load(),
+			EWMAMs:     b.getEWMA(),
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -126,15 +184,25 @@ func (lb *LoadBalancer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
 
+	overloadedCount := 0
+	for _, b := range lb.backends {
+		if b.Overloaded.Load() {
+			overloadedCount++
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"total":          lb.metrics.Total.Load(),
-		"success":        lb.metrics.Success.Load(),
-		"failed":         lb.metrics.Failed.Load(),
-		"backend_errors": lb.metrics.BackendErrors.Load(),
-		"p50_ms":         percentile(cp, 50).Milliseconds(),
-		"p95_ms":         percentile(cp, 95).Milliseconds(),
-		"p99_ms":         percentile(cp, 99).Milliseconds(),
+		"total":               lb.metrics.Total.Load(),
+		"success":             lb.metrics.Success.Load(),
+		"failed":              lb.metrics.Failed.Load(),
+		"backend_errors":      lb.metrics.BackendErrors.Load(),
+		"p50_ms":              percentile(cp, 50).Milliseconds(),
+		"p95_ms":              percentile(cp, 95).Milliseconds(),
+		"p99_ms":              percentile(cp, 99).Milliseconds(),
+		"threshold_ms":        lb.thresholdMs,
+		"ewma_alpha":          lb.ewmaAlpha,
+		"overloaded_backends": overloadedCount,
 	})
 }
 
@@ -144,7 +212,7 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lb.metrics.Total.Add(1)
 	start := time.Now()
 
-	b := lb.nextBackend()
+	b := lb.bestBackend()
 	if b == nil {
 		lb.metrics.Failed.Add(1)
 		http.Error(w, "no healthy backend available", http.StatusServiceUnavailable)
@@ -158,11 +226,11 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	proxy := httputil.NewSingleHostReverseProxy(target)
 
 	dialer := &net.Dialer{
-		Timeout: lb.timeout, 
+		Timeout: lb.timeout,
 	}
 	proxy.Transport = &http.Transport{
 		DialContext:           dialer.DialContext,
-		ResponseHeaderTimeout: lb.timeout, 
+		ResponseHeaderTimeout: lb.timeout,
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 	}
 
@@ -184,6 +252,7 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !errored {
 		lb.metrics.Success.Add(1)
 		elapsed := time.Since(start)
+		b.recordLatency(elapsed, lb.ewmaAlpha, lb.thresholdMs)
 		lb.metrics.LatencyMu.Lock()
 		lb.metrics.Latencies = append(lb.metrics.Latencies, elapsed)
 		lb.metrics.LatencyMu.Unlock()
@@ -215,10 +284,20 @@ func main() {
 	backendTimeout := flag.Duration("backend-timeout", 800*time.Millisecond,
 		"backend request timeout")
 
+	thresholdMs := flag.Float64("threshold-ms", 200,
+		"EWMA ms above which backend is overloaded")
+
+	ewmaAlpha := flag.Float64("ewma-alpha", 0.2,
+		"smoothing factor: higher = faster reaction")
+
 	flag.Parse()
 
 	// Build backend list
-	lb := &LoadBalancer{timeout: *backendTimeout}
+	lb := &LoadBalancer{
+		timeout:     *backendTimeout,
+		thresholdMs: *thresholdMs,
+		ewmaAlpha:   *ewmaAlpha,
+	}
 	for _, raw := range strings.Split(*backendsFlag, ",") {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
@@ -242,15 +321,17 @@ func main() {
 	go lb.healthLoop(*healthInterval)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/lb/health",  lb.healthHandler)
-	mux.HandleFunc("/lb/status",  lb.statusHandler)
+	mux.HandleFunc("/lb/health", lb.healthHandler)
+	mux.HandleFunc("/lb/status", lb.statusHandler)
 	mux.HandleFunc("/lb/metrics", lb.metricsHandler)
 	mux.Handle("/", lb)
 
 	fmt.Printf("\nLoad Balancer listening on %s\n", *addr)
-	fmt.Printf("Backends : %d\n", len(lb.backends))
-	fmt.Printf("Health   : every %s\n", *healthInterval)
-	fmt.Printf("Timeout  : %s\n\n", *backendTimeout)
+	fmt.Printf("Backends   : %d\n", len(lb.backends))
+	fmt.Printf("Threshold  : %.1f ms\n", *thresholdMs)
+	fmt.Printf("EWMA Alpha : %.2f\n", *ewmaAlpha)
+	fmt.Printf("Health     : every %s\n", *healthInterval)
+	fmt.Printf("Timeout    : %s\n\n", *backendTimeout)
 	fmt.Printf("  /lb/health   — LB liveness\n")
 	fmt.Printf("  /lb/status   — backend states\n")
 	fmt.Printf("  /lb/metrics  — counters + latency\n")

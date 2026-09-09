@@ -35,10 +35,15 @@ def _get_hmac_secret() -> bytes:
 # ── Initialisation ────────────────────────────────────────────────────────────
 
 def init_db() -> None:
-    """Ping Valkey to ensure connection."""
+    """Ping Valkey to ensure connection and create room loadtest if not exists."""
     try:
         r.ping()
         print(f"[DB] Initialised — connected to Valkey at {_valkey_url}")
+        if not r.exists("room:loadtest"):
+            try:
+                create_room(room_id="loadtest", name="Load Test", created_by="system", is_public=True, avatar="⚡")
+            except Exception:
+                pass
     except redis.ConnectionError:
         print(f"[DB] Error connecting to Valkey at {_valkey_url}")
 
