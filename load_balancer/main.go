@@ -26,6 +26,7 @@ type Backend struct {
 	Alive      atomic.Bool
 	InFlight   atomic.Int64
 	Overloaded atomic.Bool // true when EWMA > thresholdMs
+	proxy      *httputil.ReverseProxy // created once at startup; reused for every request
 
 	ewmaMu sync.Mutex
 	ewmaMs float64 // exponential weighted moving average latency in ms
@@ -222,34 +223,15 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b.InFlight.Add(1)
 	defer b.InFlight.Add(-1)
 
-	target := b.URL
-	proxy := httputil.NewSingleHostReverseProxy(target)
-
-	dialer := &net.Dialer{
-		Timeout: lb.timeout,
-	}
-	proxy.Transport = &http.Transport{
-		DialContext:           dialer.DialContext,
-		ResponseHeaderTimeout: lb.timeout,
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-	}
-
+	// Apply per-request timeout via context
 	ctx, cancel := context.WithTimeout(r.Context(), lb.timeout)
 	defer cancel()
 	r = r.WithContext(ctx)
 
-	errored := false
-	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-		errored = true
-		b.Alive.Store(false)
-		lb.metrics.BackendErrors.Add(1)
-		lb.metrics.Failed.Add(1)
-		http.Error(rw, "backend unavailable", http.StatusBadGateway)
-	}
+	// Delegate to the pre-created, connection-pooling reverse proxy
+	b.proxy.ServeHTTP(w, r)
 
-	proxy.ServeHTTP(w, r)
-
-	if !errored {
+	if b.Alive.Load() {
 		lb.metrics.Success.Add(1)
 		elapsed := time.Since(start)
 		b.recordLatency(elapsed, lb.ewmaAlpha, lb.thresholdMs)
@@ -292,7 +274,24 @@ func main() {
 
 	flag.Parse()
 
-	// Build backend list
+	// Build backend list with pre-created connection-pooling proxies
+	//
+	// One shared TLS transport per process:
+	//   - MaxIdleConnsPerHost  → keeps TCP connections warm (avoids TCP handshake on every request)
+	//   - IdleConnTimeout      → evicts stale keep-alive connections after 90 s
+	//   - InsecureSkipVerify   → allows self-signed certs from the Python backend
+	sharedTransport := &http.Transport{
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 64,
+		IdleConnTimeout:     90 * time.Second,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		DialContext: (&net.Dialer{
+			Timeout:   *backendTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ResponseHeaderTimeout: *backendTimeout,
+	}
+
 	lb := &LoadBalancer{
 		timeout:     *backendTimeout,
 		thresholdMs: *thresholdMs,
@@ -308,7 +307,19 @@ func main() {
 			log.Fatalf("invalid backend URL %q: %v", raw, err)
 		}
 		b := &Backend{URL: u}
+
+		// Create the reverse proxy once; bind error handler via closure over b + lb
+		p := httputil.NewSingleHostReverseProxy(u)
+		p.Transport = sharedTransport
+		p.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+			b.Alive.Store(false)
+			lb.metrics.BackendErrors.Add(1)
+			lb.metrics.Failed.Add(1)
+			http.Error(rw, "backend unavailable", http.StatusBadGateway)
+		}
+		b.proxy = p
 		b.Alive.Store(true)
+
 		lb.backends = append(lb.backends, b)
 		log.Printf("[LB] registered backend: %s", u)
 	}
