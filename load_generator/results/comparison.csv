@@ -1,2 +1,3 @@
 experiment,users,duration_s,successful,failed,total,throughput_rps,dropout_percent,p50_ms,p95_ms,p99_ms
 stress_monitored,50,120.0,8886,0,8886,74.04,0.00,27.71,80.65,112.20
+baseline_test,50,30.5,172,1489,1661,5.64,89.64,185.26,656.21,776.73
