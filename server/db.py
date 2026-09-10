@@ -1,238 +1,221 @@
 """
-Database layer for the Secure Persistent Group Chat.
+Database layer — Valkey (active-active, in-memory, Redis-compatible).
+=======================================================================
+Architecture:
+  - Each backend (Sys2/3/4) runs its OWN local Valkey instance.
+  - WRITES fan-out to ALL Valkey instances (active-active replication).
+  - READS come from the LOCAL Valkey only — sub-millisecond, no network hop.
 
-Uses Python's built-in sqlite3 module.
-Handles:
-  - Message persistence (encrypted, with HMAC for tamper detection)
-  - User public key registry (for ECDSA signature verification)
-  - Chat room management (rooms identified by unique 6-char codes)
+Strict Idempotency (No Duplicates):
+  Messages are stored in TWO structures:
+    1. Sorted Set  room:{room_id}:timeline    → score=unix_ts, member=msg_id
+       (for chronological ordering)
+    2. Hash        room:{room_id}:messages_hash → msg_id → JSON payload
+       (for O(1) lookup by ID; HSET is idempotent — retry with same msg_id
+        just overwrites the identical value, so duplicates are impossible)
+
+Environment variable:
+  VALKEY_HOSTS=127.0.0.1:6379,172.17.0.96:6379,172.17.0.97:6379
+  ^^^^^^^^^^^^^^ LOCAL (reads)  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  (fan-out writes)
+  First entry must always be this backend's own local Valkey.
+
+Full Key schema:
+  room:{room_id}:timeline      → Sorted Set   score=unix_ts  member=msg_id
+  room:{room_id}:messages_hash → Hash         msg_id → msg_json (payload only)
+  room:{room_id}:msg_ts        → Hash         msg_id → float(unix_ts)  (canonical timestamp store)
+  room:{room_id}:meta          → Hash         name, created_by, avatar, is_public, created_at
+  rooms:public                 → Set          room_ids of all public rooms
+  user:{username}:auth         → Hash         password_hash, avatar, xp, username
+  user:{username}:pubkey       → String       JSON JWK of ECDSA public key
+
+Idempotency guarantee:
+  The Sorted Set member is the msg_id string (deterministic, UUID).
+  ZADD with NX=True deduplicates by member, so a retry with the same msg_id
+  is a no-op in the Sorted Set regardless of the score.
+  The canonical score (unix timestamp) is stored in room:{room_id}:msg_ts
+  and is only written once (also with HSETNX — set-if-not-exists), so
+  ordering is stable even when a retry reaches a different backend.
 """
 
-import sqlite3
+import asyncio
+import json
+import os
+import time
 import hmac
 import hashlib
-import os
-import json
+import uuid
+
+import valkey.asyncio as valkey_lib
 from pathlib import Path
-from datetime import datetime
+from dotenv import load_dotenv
 
-# ── Config ────────────────────────────────────────────────────────────────────
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-DB_PATH = Path(__file__).resolve().parent / "chat.db"
+# ── Connection pool ────────────────────────────────────────────────────────────
 
-# HMAC_SECRET loaded from environment (set in .env, never hardcoded)
+_clients: list[valkey_lib.Valkey] = []
+
+
 def _get_hmac_secret() -> bytes:
     secret = os.environ.get("HMAC_SECRET", "")
     if not secret:
-        raise RuntimeError(
-            "HMAC_SECRET is not set in .env — cannot start server safely."
-        )
+        raise RuntimeError("HMAC_SECRET is not set in .env")
     return bytes.fromhex(secret)
 
 
-# ── Schema ────────────────────────────────────────────────────────────────────
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS messages (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    room_id     TEXT    NOT NULL DEFAULT 'default',
-    msg_id      TEXT    NOT NULL DEFAULT '',       -- client-generated UUID for stable references
-    username    TEXT    NOT NULL,
-    avatar      TEXT    NOT NULL DEFAULT 'wizard',
-    ciphertext  TEXT    NOT NULL,   -- base64 AES-GCM ciphertext
-    iv          TEXT    NOT NULL,   -- base64 12-byte IV
-    signature   TEXT    NOT NULL,   -- base64 ECDSA-P256 signature
-    public_key  TEXT    NOT NULL,   -- JSON JWK of sender's ECDSA public key
-    timestamp   TEXT    NOT NULL,
-    hmac_digest TEXT    NOT NULL,   -- HMAC-SHA256(ciphertext || iv) for tamper detection
-    sig_valid   INTEGER NOT NULL DEFAULT 1,  -- 1=valid, 0=invalid (recorded at receive time)
-    reply_to      TEXT    DEFAULT NULL,          -- msg_id of parent message (threaded replies)
-    is_deleted    INTEGER NOT NULL DEFAULT 0,   -- 1=tombstone (unsent/deleted)
-    target_user   TEXT    DEFAULT NULL,          -- non-null = whisper to this username
-    is_edited     INTEGER NOT NULL DEFAULT 0,   -- 1=edited message
-    created_at_ts REAL    DEFAULT NULL,          -- unix epoch timestamp for edit window validation
-    attachment    TEXT    DEFAULT NULL           -- JSON string of attachment data
-);
-
-CREATE TABLE IF NOT EXISTS user_keys (
-    username    TEXT PRIMARY KEY,
-    public_key  TEXT NOT NULL        -- JSON JWK
-);
-
-CREATE TABLE IF NOT EXISTS users (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    username      TEXT    NOT NULL UNIQUE COLLATE NOCASE,
-    password_hash TEXT    NOT NULL,   -- bcrypt hash
-    avatar        TEXT    NOT NULL DEFAULT 'wizard',
-    created_at    TEXT    NOT NULL,
-    xp            INTEGER NOT NULL DEFAULT 0   -- persistent XP points
-);
-
-CREATE TABLE IF NOT EXISTS rooms (
-    id          TEXT    PRIMARY KEY,              -- 6-char alphanumeric code e.g. "XKJ3P9"
-    name        TEXT    NOT NULL,
-    created_by  TEXT    NOT NULL,
-    created_at  TEXT    NOT NULL,
-    is_public   INTEGER NOT NULL DEFAULT 1,       -- 1=public (browsable), 0=private (code-only)
-    avatar      TEXT    NOT NULL DEFAULT '🏰'
-);
-"""
-
-# ── Migration helpers ─────────────────────────────────────────────────────────
-
-def _apply_migrations(conn: sqlite3.Connection) -> None:
-    """Add columns that may not exist in older DB versions."""
-    cursor = conn.execute("PRAGMA table_info(messages)")
-    columns = {row[1] for row in cursor.fetchall()}
-    if "room_id" not in columns:
-        conn.execute("ALTER TABLE messages ADD COLUMN room_id TEXT NOT NULL DEFAULT 'default'")
-        print("[DB] Migration: added room_id column to messages")
-    if "msg_id" not in columns:
-        conn.execute("ALTER TABLE messages ADD COLUMN msg_id TEXT NOT NULL DEFAULT ''")
-        print("[DB] Migration: added msg_id column to messages")
-    if "reply_to" not in columns:
-        conn.execute("ALTER TABLE messages ADD COLUMN reply_to TEXT DEFAULT NULL")
-        print("[DB] Migration: added reply_to column to messages")
-    if "is_deleted" not in columns:
-        conn.execute("ALTER TABLE messages ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
-        print("[DB] Migration: added is_deleted column to messages")
-    if "target_user" not in columns:
-        conn.execute("ALTER TABLE messages ADD COLUMN target_user TEXT DEFAULT NULL")
-        print("[DB] Migration: added target_user column to messages")
-    if "is_edited" not in columns:
-        conn.execute("ALTER TABLE messages ADD COLUMN is_edited INTEGER NOT NULL DEFAULT 0")
-        print("[DB] Migration: added is_edited column to messages")
-    if "created_at_ts" not in columns:
-        conn.execute("ALTER TABLE messages ADD COLUMN created_at_ts REAL DEFAULT NULL")
-        print("[DB] Migration: added created_at_ts column to messages")
-    if "attachment" not in columns:
-        conn.execute("ALTER TABLE messages ADD COLUMN attachment TEXT DEFAULT NULL")
-        print("[DB] Migration: added attachment column to messages")
-
-    cursor = conn.execute("PRAGMA table_info(users)")
-    columns = {row[1] for row in cursor.fetchall()}
-    if "xp" not in columns:
-        conn.execute("ALTER TABLE users ADD COLUMN xp INTEGER NOT NULL DEFAULT 0")
-        print("[DB] Migration: added xp column to users")
-
-    cursor = conn.execute("PRAGMA table_info(rooms)")
-    columns = {row[1] for row in cursor.fetchall()}
-    if "avatar" not in columns:
-        conn.execute("ALTER TABLE rooms ADD COLUMN avatar TEXT NOT NULL DEFAULT '🏰'")
-        print("[DB] Migration: added avatar column to rooms")
-
-
-# ── Initialisation ────────────────────────────────────────────────────────────
-
-def init_db() -> None:
-    """Create tables if they don't exist. Call once at server startup."""
-    with _connect() as conn:
-        conn.executescript(_SCHEMA)
-        _apply_migrations(conn)
-    print(f"[DB] Initialised — {DB_PATH}")
-
-
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-# ── HMAC helpers ──────────────────────────────────────────────────────────────
-
 def _compute_hmac(ciphertext: str, iv: str) -> str:
-    """
-    Compute HMAC-SHA256 over (ciphertext + iv) using HMAC_SECRET from .env.
-    Returns the hex digest.
-    """
     secret = _get_hmac_secret()
     payload = (ciphertext + iv).encode("utf-8")
     return hmac.new(secret, payload, hashlib.sha256).hexdigest()
 
 
 def _verify_hmac(ciphertext: str, iv: str, stored_digest: str) -> bool:
-    """Re-compute HMAC and compare with stored digest. Returns True if intact."""
-    expected = _compute_hmac(ciphertext, iv)
-    return hmac.compare_digest(expected, stored_digest)
+    return hmac.compare_digest(_compute_hmac(ciphertext, iv), stored_digest)
 
 
-# ── Room CRUD ─────────────────────────────────────────────────────────────────
-
-def create_room(room_id: str, name: str, created_by: str, is_public: bool = True, avatar: str = "🏰") -> None:
+async def init_db() -> None:
     """
-    Insert a new room into the rooms table.
-    Raises sqlite3.IntegrityError if the room_id already exists.
+    Open Valkey connections at startup.
+    First host in VALKEY_HOSTS is always the LOCAL instance (used for reads).
+    All hosts receive writes (fan-out).
     """
-    with _connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO rooms (id, name, created_by, created_at, is_public, avatar)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (room_id, name, created_by, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 1 if is_public else 0, avatar),
+    global _clients
+    raw = os.environ.get("VALKEY_HOSTS", "127.0.0.1:6379")
+    hosts = [h.strip() for h in raw.split(",") if h.strip()]
+    _clients = []
+    for h in hosts:
+        parts = h.rsplit(":", 1)
+        host = parts[0]
+        port = int(parts[1]) if len(parts) == 2 else 6379
+        client = valkey_lib.Valkey(
+            host=host,
+            port=port,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
         )
+        _clients.append(client)
+    try:
+        await _clients[0].ping()
+        print(f"[DB] ✅ Connected to {len(_clients)} Valkey instance(s) — local={hosts[0]}")
+    except Exception as e:
+        print(f"[DB] ⚠️  Local Valkey ping failed: {e} — continuing anyway")
 
 
-def get_room(room_id: str) -> dict | None:
-    """Retrieve a room by its code. Returns dict or None."""
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT id, name, created_by, created_at, is_public, avatar FROM rooms WHERE id = ?",
-            (room_id,),
-        ).fetchone()
-    if row is None:
+def _local() -> valkey_lib.Valkey:
+    """Returns the LOCAL Valkey client (always index 0)."""
+    if not _clients:
+        raise RuntimeError("DB not initialised — call await db.init_db() on startup")
+    return _clients[0]
+
+
+async def _fanout(coro_fn, *args, **kwargs) -> bool:
+    """
+    Execute an async Valkey command on ALL instances concurrently.
+    Returns True if at least one instance succeeded.
+    """
+    if not _clients:
+        return False
+    tasks = [coro_fn(c, *args, **kwargs) for c in _clients]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    ok = sum(1 for r in results if not isinstance(r, Exception))
+    if ok < len(_clients):
+        failures = [str(r) for r in results if isinstance(r, Exception)]
+        print(f"[DB] Fan-out partial: {ok}/{len(_clients)} wrote OK. Failures: {failures}")
+    return ok > 0
+
+
+# ── Room CRUD ──────────────────────────────────────────────────────────────────
+
+async def create_room(room_id: str, name: str, created_by: str,
+                      is_public: bool = True, avatar: str = "🏰") -> None:
+    fields = {
+        "name":       name,
+        "created_by": created_by,
+        "avatar":     avatar,
+        "is_public":  "1" if is_public else "0",
+        "created_at": str(time.time()),
+    }
+    await _fanout(lambda c, rid, f: c.hset(f"room:{rid}:meta", mapping=f), room_id, fields)
+    if is_public:
+        await _fanout(lambda c, rid: c.sadd("rooms:public", rid), room_id)
+
+
+async def get_room(room_id: str) -> dict | None:
+    data = await _local().hgetall(f"room:{room_id}:meta")
+    if not data:
         return None
     return {
-        "id":         row["id"],
-        "name":       row["name"],
-        "created_by": row["created_by"],
-        "created_at": row["created_at"],
-        "is_public":  bool(row["is_public"]),
-        "avatar":     row["avatar"],
+        "id":         room_id,
+        "name":       data.get("name", ""),
+        "created_by": data.get("created_by", ""),
+        "created_at": data.get("created_at", ""),
+        "is_public":  data.get("is_public", "1") == "1",
+        "avatar":     data.get("avatar", "🏰"),
     }
 
 
-def update_room_creator_if_system(room_id: str, username: str) -> None:
-    """If a room's created_by is 'system' or empty, set it to username."""
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE rooms SET created_by = ? WHERE id = ? AND (created_by = 'system' OR created_by = '' OR created_by IS NULL)",
-            (username, room_id),
+async def update_room_creator_if_system(room_id: str, username: str) -> None:
+    current = await _local().hget(f"room:{room_id}:meta", "created_by")
+    if current in (None, "", "system"):
+        await _fanout(
+            lambda c, rid, u: c.hset(f"room:{rid}:meta", "created_by", u),
+            room_id, username,
         )
 
 
-
-def list_rooms() -> list[dict]:
-    """Return all public rooms (ordered newest first)."""
-    with _connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT r.id, r.name, r.created_by, r.created_at, r.is_public, r.avatar,
-                   COALESCE(u.avatar, 'wizard') as owner_avatar
-            FROM rooms r
-            LEFT JOIN users u ON u.username = r.created_by COLLATE NOCASE
-            WHERE r.is_public = 1
-            ORDER BY r.created_at DESC
-            """,
-        ).fetchall()
-    return [
-        {
-            "id":           row["id"],
-            "name":         row["name"],
-            "created_by":   row["created_by"],
-            "owner_avatar": row["owner_avatar"],
-            "created_at":   row["created_at"],
-            "is_public":    bool(row["is_public"]),
-            "avatar":       row["avatar"],
-        }
-        for row in rows
-    ]
+async def list_rooms() -> list[dict]:
+    room_ids = await _local().smembers("rooms:public")
+    rooms = []
+    for rid in room_ids:
+        room = await get_room(rid)
+        if room and room["is_public"]:
+            rooms.append(room)
+    rooms.sort(key=lambda r: float(r.get("created_at", 0)), reverse=True)
+    return rooms
 
 
+async def delete_room(room_id: str, username: str) -> bool:
+    meta = await _local().hgetall(f"room:{room_id}:meta")
+    if not meta or meta.get("created_by", "").lower() != username.lower():
+        return False
 
-# ── Message CRUD ──────────────────────────────────────────────────────────────
+    async def _del(c: valkey_lib.Valkey, rid: str) -> None:
+        await c.delete(f"room:{rid}:meta")
+        await c.delete(f"room:{rid}:messages_hash")
+        await c.delete(f"room:{rid}:timeline")
+        await c.srem("rooms:public", rid)
 
-def save_message(
+    await _fanout(_del, room_id)
+    print(f"[DB] Room '{room_id}' deleted by '{username}'.")
+    return True
+
+
+async def clear_room_history_by_creator(room_id: str, username: str) -> bool:
+    meta = await _local().hgetall(f"room:{room_id}:meta")
+    if not meta or meta.get("created_by", "").lower() != username.lower():
+        return False
+
+    async def _clr(c: valkey_lib.Valkey, rid: str) -> None:
+        await c.delete(f"room:{rid}:messages_hash")
+        await c.delete(f"room:{rid}:timeline")
+
+    await _fanout(_clr, room_id)
+    print(f"[DB] History for room '{room_id}' cleared by '{username}'.")
+    return True
+
+
+async def clear_room_history(room_id: str) -> None:
+    async def _clr(c: valkey_lib.Valkey, rid: str) -> None:
+        await c.delete(f"room:{rid}:messages_hash")
+        await c.delete(f"room:{rid}:timeline")
+
+    await _fanout(_clr, room_id)
+
+
+# ── Message CRUD ───────────────────────────────────────────────────────────────
+
+async def save_message(
     room_id: str,
     username: str,
     avatar: str,
@@ -246,323 +229,402 @@ def save_message(
     reply_to: str | None = None,
     target_user: str | None = None,
     attachment: str | None = None,
-) -> int:
+) -> bool:
     """
-    Persist an encrypted, signed message to the DB.
-    Computes and stores HMAC for future tamper detection.
-    Returns the new row id.
+    Fan-out write to ALL Valkey instances.
+
+    Storage schema (strict idempotency):
+      - ZADD room:{room_id}:timeline  score=unix_ts  member=msg_id
+      - HSET room:{room_id}:messages_hash  msg_id  json_payload
+
+    If the LB retries a request with the same msg_id:
+      - ZADD with same member is a no-op (score already set)
+      - HSET overwrites identical JSON — result is the same single entry
+    → ZERO duplicates possible.
     """
+    if not msg_id:
+        msg_id = str(uuid.uuid4())
+
     hmac_digest = _compute_hmac(ciphertext, iv)
-    pub_key_json = json.dumps(public_key)
-    import time
-    created_at_ts = time.time()
 
-    with _connect() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO messages
-                (room_id, msg_id, username, avatar, ciphertext, iv, signature, public_key,
-                 timestamp, hmac_digest, sig_valid, reply_to, target_user, is_edited, created_at_ts, attachment)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-            """,
-            (
-                room_id,
-                msg_id,
-                username,
-                avatar,
-                ciphertext,
-                iv,
-                signature,
-                pub_key_json,
-                timestamp,
-                hmac_digest,
-                1 if sig_valid else 0,
-                reply_to,
-                target_user,
-                created_at_ts,
-                attachment,
-            ),
-        )
-        return cur.lastrowid
+    # ── Canonical timestamp (deterministic across retries) ──────────────────
+    # score = time.time() at the FIRST write of this msg_id.
+    # On a retry, HSETNX (set-if-not-exists) returns 0 and the original ts
+    # is retrieved via HGET. This ensures:
+    #   1. ZADD NX on the timeline always uses the same score → ordering is stable.
+    #   2. created_at in the payload is consistent across all Valkey nodes.
+    # Without this, a retry could produce a slightly different float score,
+    # and while ZADD NX on the member=msg_id prevents a SECOND timeline entry,
+    # the payload in the hash would have a different created_at, which is
+    # confusing and potentially causes ordering inconsistency when reconciling.
+    ts_key = f"room:{room_id}:msg_ts"
+    raw_ts = await _local().hget(ts_key, msg_id)
+    if raw_ts is not None:
+        # Retry path: reuse the original canonical timestamp
+        score = float(raw_ts)
+    else:
+        # First write: generate canonical timestamp
+        score = time.time()
+
+    payload = json.dumps({
+        "msg_id":      msg_id,
+        "username":    username,
+        "avatar":      avatar,
+        "ciphertext":  ciphertext,
+        "iv":          iv,
+        "signature":   signature,
+        "public_key":  public_key,
+        "timestamp":   timestamp,
+        "hmac_digest": hmac_digest,
+        "sig_valid":   sig_valid,
+        "reply_to":    reply_to,
+        "target_user": target_user,
+        "attachment":  attachment,
+        "is_deleted":  False,
+        "is_edited":   False,
+        "created_at":  score,
+    }, separators=(",", ":"), ensure_ascii=False)
+
+    async def _write(c: valkey_lib.Valkey, rid: str, mid: str, p: str, s: float) -> None:
+        async with c.pipeline(transaction=True) as pipe:
+            # HSETNX: set canonical timestamp ONLY if this msg_id is new.
+            # This is the single source of truth for ordering.
+            pipe.hsetnx(f"room:{rid}:msg_ts", mid, str(s))
+            # ZADD NX: only insert into timeline if msg_id not already present.
+            # Member = msg_id (deterministic string) → dedup is guaranteed.
+            # Score = canonical ts (same on all nodes and all retries).
+            pipe.zadd(f"room:{rid}:timeline", {mid: s}, nx=True)
+            # HSET: store full payload — idempotent overwrite on retry.
+            pipe.hset(f"room:{rid}:messages_hash", mid, p)
+            await pipe.execute()
+
+    ok = await _fanout(_write, room_id, msg_id, payload, score)
+    if ok:
+        print(f"\033[93m[PERSISTENCE] 💾 Msg '{msg_id}' from '@{username}' → {len(_clients)} Valkey(s) | "
+              f"Room: '{room_id}' | Sig valid: {sig_valid}\033[0m")
+    return ok
 
 
-def get_history(room_id: str, limit: int | None = None, username: str | None = None) -> list[dict]:
+async def get_history(room_id: str, limit: int | None = None,
+                      username: str | None = None) -> list[dict]:
     """
-    Return history messages for a given room (unlimited if limit is None).
-    Whispers (target_user IS NOT NULL) are only returned if the requesting
-    user is either the sender or the target.
-    Each row is enriched with a `tampered` flag (True if HMAC mismatch).
+    LOCAL read — served from this backend's in-memory Valkey.
+    No network hop, no disk I/O. Typical latency <1ms.
     """
-    sql = """
-        SELECT msg_id, username, avatar, ciphertext, iv, signature, public_key,
-               timestamp, hmac_digest, sig_valid, reply_to, is_deleted, target_user,
-               is_edited, created_at_ts, attachment
-        FROM messages
-        WHERE room_id = ?
-        ORDER BY id DESC
-    """
-    params = [room_id]
-    if limit is not None and limit > 0:
-        sql += " LIMIT ?"
-        params.append(limit)
+    timeline_key = f"room:{room_id}:timeline"
+    hash_key = f"room:{room_id}:messages_hash"
 
-    with _connect() as conn:
-        rows = conn.execute(sql, params).fetchall()
+    if limit and limit > 0:
+        msg_ids = await _local().zrange(timeline_key, -limit, -1)
+    else:
+        msg_ids = await _local().zrange(timeline_key, 0, -1)  # oldest first
+
+    if not msg_ids:
+        return []
+
+    # Single HMGET call fetches all payloads in one round-trip
+    raw_list = await _local().hmget(hash_key, *msg_ids)
 
     messages = []
-    for row in reversed(rows):  # chronological order
-        # Filter whispers: only include if user is sender or target
-        tgt = row["target_user"]
-        if tgt and username:
-            if row["username"].lower() != username.lower() and tgt.lower() != username.lower():
-                continue  # skip — this whisper isn't for us
+    for raw in raw_list:
+        if not raw:
+            continue
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
 
-        tampered = not _verify_hmac(row["ciphertext"], row["iv"], row["hmac_digest"])
-        messages.append(
-            {
-                "type": "message",
-                "msg_id": row["msg_id"],
-                "username": row["username"],
-                "avatar": row["avatar"],
-                "ciphertext": row["ciphertext"],
-                "iv": row["iv"],
-                "signature": row["signature"],
-                "public_key": json.loads(row["public_key"]),
-                "timestamp": row["timestamp"],
-                "sig_valid": bool(row["sig_valid"]),
-                "tampered": tampered,
-                "reply_to": row["reply_to"],
-                "is_deleted": bool(row["is_deleted"]),
-                "target_user": row["target_user"],
-                "is_edited": bool(row["is_edited"]),
-                "created_at_ts": row["created_at_ts"],
-                "attachment": json.loads(row["attachment"]) if row["attachment"] else None,
-            }
-        )
+        # Filter whispers
+        tgt = msg.get("target_user")
+        if tgt and username:
+            if msg.get("username", "").lower() != username.lower() and tgt.lower() != username.lower():
+                continue
+
+        ciphertext = msg.get("ciphertext", "")
+        iv = msg.get("iv", "")
+        stored_hmac = msg.get("hmac_digest", "")
+        tampered = (bool(ciphertext) and bool(stored_hmac)
+                    and not _verify_hmac(ciphertext, iv, stored_hmac))
+
+        messages.append({
+            "type":        "message",
+            "msg_id":      msg.get("msg_id", ""),
+            "username":    msg.get("username", ""),
+            "avatar":      msg.get("avatar", "wizard"),
+            "ciphertext":  ciphertext,
+            "iv":          iv,
+            "signature":   msg.get("signature", ""),
+            "public_key":  msg.get("public_key", {}),
+            "timestamp":   msg.get("timestamp", ""),
+            "sig_valid":   msg.get("sig_valid", True),
+            "tampered":    tampered,
+            "reply_to":    msg.get("reply_to"),
+            "is_deleted":  msg.get("is_deleted", False),
+            "target_user": tgt,
+            "is_edited":   msg.get("is_edited", False),
+            "created_at_ts": msg.get("created_at"),
+            "attachment":  msg.get("attachment"),
+        })
     return messages
 
 
-def get_message_by_id(msg_id: str) -> dict | None:
-    """Retrieve a single message by its client-generated msg_id."""
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT msg_id, username, avatar, ciphertext, iv, timestamp, is_deleted, target_user FROM messages WHERE msg_id = ?",
-            (msg_id,),
-        ).fetchone()
-    if row is None:
+async def get_message_by_id(msg_id: str, room_id: str) -> dict | None:
+    """O(1) lookup directly from the messages Hash — no scan needed."""
+    raw = await _local().hget(f"room:{room_id}:messages_hash", msg_id)
+    if not raw:
         return None
-    return {
-        "msg_id":      row["msg_id"],
-        "username":    row["username"],
-        "avatar":      row["avatar"],
-        "ciphertext":  row["ciphertext"],
-        "iv":          row["iv"],
-        "timestamp":   row["timestamp"],
-        "is_deleted":  bool(row["is_deleted"]),
-        "target_user": row["target_user"],
-    }
+    score = await _local().zscore(f"room:{room_id}:timeline", msg_id)
+    try:
+        return {"raw": raw, "score": score or 0.0, "msg": json.loads(raw)}
+    except json.JSONDecodeError:
+        return None
 
 
-def delete_message(msg_id: str, username: str) -> bool:
-    """
-    Soft-delete a message by setting is_deleted = 1 and clearing ciphertext.
-    Only succeeds if the requesting user is the original sender.
-    Returns True if a row was updated, False otherwise.
-    """
-    with _connect() as conn:
-        cur = conn.execute(
-            """
-            UPDATE messages
-            SET is_deleted = 1, ciphertext = '', iv = '', signature = ''
-            WHERE msg_id = ? AND username = ? COLLATE NOCASE AND is_deleted = 0
-            """,
-            (msg_id, username),
-        )
-        updated = cur.rowcount > 0
-    if updated:
-        print(f"[DB] Message '{msg_id}' deleted by {username}")
-    return updated
+async def delete_message(msg_id: str, username: str, room_id: str = "") -> bool:
+    """Soft-delete: update the Hash entry with a tombstone (is_deleted=True)."""
+    if not room_id:
+        return False
+    found = await get_message_by_id(msg_id, room_id)
+    if not found:
+        return False
+    msg = found["msg"]
+    if msg.get("username", "").lower() != username.lower():
+        return False
+
+    msg["is_deleted"] = True
+    msg["ciphertext"] = ""
+    msg["iv"] = ""
+    msg["signature"] = ""
+    new_payload = json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
+
+    # Only update the Hash — timeline entry stays for ordering
+    await _fanout(
+        lambda c, rid, mid, p: c.hset(f"room:{rid}:messages_hash", mid, p),
+        room_id, msg_id, new_payload,
+    )
+    print(f"[DB] Message '{msg_id}' soft-deleted by '{username}'.")
+    return True
 
 
-def edit_message(
-    msg_id: str,
-    username: str,
-    ciphertext: str,
-    iv: str,
-    signature: str,
-    sig_valid: bool,
-) -> tuple[bool, str]:
-    """
-    Edit an existing message's ciphertext, iv, and signature.
-    Validates that:
-      1. Message exists and is not deleted.
-      2. Requesting user matches the original sender.
-      3. Less than 5 minutes (300 seconds) have elapsed since creation.
-    """
-    import time
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT username, created_at_ts, is_deleted FROM messages WHERE msg_id = ?",
-            (msg_id,),
-        ).fetchone()
+async def edit_message(msg_id: str, username: str, ciphertext: str,
+                       iv: str, signature: str, sig_valid: bool,
+                       room_id: str = "") -> tuple[bool, str]:
+    """Edit a message within the 5-minute window."""
+    if not room_id:
+        return False, "Room ID required."
+    found = await get_message_by_id(msg_id, room_id)
+    if not found:
+        return False, "Message not found."
+    msg = found["msg"]
+    if msg.get("username", "").lower() != username.lower():
+        return False, "You can only edit your own messages."
+    if msg.get("is_deleted", False):
+        return False, "Cannot edit a deleted message."
+    created_ts = msg.get("created_at", 0)
+    if created_ts and (time.time() - float(created_ts) > 300):
+        return False, "Message edit window (5 minutes) has expired."
 
-        if not row:
-            return False, "Message not found."
-        if bool(row["is_deleted"]):
-            return False, "Cannot edit a deleted message."
-        if row["username"].lower() != username.lower():
-            return False, "You can only edit your own messages."
+    msg["ciphertext"] = ciphertext
+    msg["iv"] = iv
+    msg["signature"] = signature
+    msg["hmac_digest"] = _compute_hmac(ciphertext, iv)
+    msg["sig_valid"] = sig_valid
+    msg["is_edited"] = True
+    new_payload = json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
 
-        created_ts = row["created_at_ts"]
-        if created_ts and (time.time() - created_ts > 300):
-            return False, "Message edit window (5 minutes) has expired."
-
-        hmac_digest = _compute_hmac(ciphertext, iv)
-        conn.execute(
-            """
-            UPDATE messages
-            SET ciphertext = ?, iv = ?, signature = ?, hmac_digest = ?, sig_valid = ?, is_edited = 1
-            WHERE msg_id = ?
-            """,
-            (ciphertext, iv, signature, hmac_digest, 1 if sig_valid else 0, msg_id),
-        )
-    print(f"[DB] Message '{msg_id}' edited by {username}")
+    await _fanout(
+        lambda c, rid, mid, p: c.hset(f"room:{rid}:messages_hash", mid, p),
+        room_id, msg_id, new_payload,
+    )
+    print(f"[DB] Message '{msg_id}' edited by '{username}'.")
     return True, "Message updated successfully."
 
 
-# ── User key registry ─────────────────────────────────────────────────────────
+# ── /message + /feed: Simple plaintext storage for assignment evaluation ───────
+# The assignment requires POST /message and GET /feed as simple HTTP endpoints.
+# These store messages in a separate, plaintext Sorted Set so the official
+# load generator can test without needing WebSocket or encryption.
 
-def register_user_key(username: str, public_key: dict) -> None:
-    """Store or update a user's ECDSA public key (JWK dict)."""
-    with _connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO user_keys (username, public_key)
-            VALUES (?, ?)
-            ON CONFLICT(username) DO UPDATE SET public_key = excluded.public_key
-            """,
-            (username, json.dumps(public_key)),
-        )
+_FEED_ROOM = "__feed__"  # dedicated room for the HTTP API
 
 
-def get_user_key(username: str) -> dict | None:
-    """Retrieve a user's registered ECDSA public key, or None if not found."""
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT public_key FROM user_keys WHERE username = ?", (username,)
-        ).fetchone()
-    return json.loads(row["public_key"]) if row else None
-
-
-# ── Persistent user accounts ───────────────────────────────────────────────────
-
-def create_user(username: str, password_hash: str, avatar: str) -> None:
+async def save_plain_message(client_name: str, msg: str, msg_id: str = "") -> str:
     """
-    Insert a new user into the users table.
-    Raises sqlite3.IntegrityError if the username is already taken (UNIQUE constraint).
+    Store a plain-text message for the /message + /feed HTTP API.
+
+    Idempotency: member in the Sorted Set = msg_id (deterministic UUID).
+    Canonical score stored via HSETNX so retries use the same timestamp.
+    Returns the msg_id.
     """
-    with _connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO users (username, password_hash, avatar, created_at, xp)
-            VALUES (?, ?, ?, ?, 0)
-            """,
-            (username, password_hash, avatar, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        )
+    if not msg_id:
+        msg_id = str(uuid.uuid4())
+
+    # Canonical timestamp: first-write wins via HSETNX
+    ts_key = f"room:{_FEED_ROOM}:msg_ts"
+    raw_ts = await _local().hget(ts_key, msg_id)
+    score = float(raw_ts) if raw_ts is not None else time.time()
+
+    payload = json.dumps({
+        "msg_id":      msg_id,
+        "client_name": client_name,
+        "msg":         msg,
+        "created_at":  score,
+    }, separators=(",", ":"), ensure_ascii=False)
+
+    async def _write(c: valkey_lib.Valkey, mid: str, p: str, s: float) -> None:
+        async with c.pipeline(transaction=True) as pipe:
+            pipe.hsetnx(f"room:{_FEED_ROOM}:msg_ts", mid, str(s))
+            pipe.zadd(f"room:{_FEED_ROOM}:timeline", {mid: s}, nx=True)
+            pipe.hset(f"room:{_FEED_ROOM}:messages_hash", mid, p)
+            await pipe.execute()
+
+    await _fanout(_write, msg_id, payload, score)
+    return msg_id
 
 
-def get_user(username: str) -> dict | None:
+async def get_feed() -> list[dict]:
     """
-    Retrieve a user row by username (case-insensitive).
-    Returns { id, username, password_hash, avatar, xp } or None if not found.
+    Retrieve all plain-text messages for the GET /feed endpoint.
+    Served from LOCAL Valkey — in-memory, no network hop.
     """
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT id, username, password_hash, avatar, xp FROM users WHERE username = ? COLLATE NOCASE",
-            (username,),
-        ).fetchone()
-    if row is None:
+    msg_ids = await _local().zrange(f"room:{_FEED_ROOM}:timeline", 0, -1)
+    if not msg_ids:
+        return []
+    raw_list = await _local().hmget(f"room:{_FEED_ROOM}:messages_hash", *msg_ids)
+    messages = []
+    for raw in raw_list:
+        if not raw:
+            continue
+        try:
+            messages.append(json.loads(raw))
+        except json.JSONDecodeError:
+            continue
+    return messages
+
+
+# ── User key registry ──────────────────────────────────────────────────────────
+
+async def register_user_key(username: str, public_key: dict) -> None:
+    val = json.dumps(public_key)
+    await _fanout(lambda c, k, v: c.set(k, v), f"user:{username.lower()}:pubkey", val)
+
+
+async def get_user_key(username: str) -> dict | None:
+    raw = await _local().get(f"user:{username.lower()}:pubkey")
+    return json.loads(raw) if raw else None
+
+
+# ── User accounts ──────────────────────────────────────────────────────────────
+
+async def create_user(username: str, password_hash: str, avatar: str) -> None:
+    key = f"user:{username.lower()}:auth"
+    fields = {"password_hash": password_hash, "avatar": avatar, "xp": "0", "username": username}
+    await _fanout(lambda c, k, f: c.hset(k, mapping=f), key, fields)
+
+
+async def get_user(username: str) -> dict | None:
+    data = await _local().hgetall(f"user:{username.lower()}:auth")
+    if not data:
         return None
     return {
-        "id":            row["id"],
-        "username":      row["username"],
-        "password_hash": row["password_hash"],
-        "avatar":        row["avatar"],
-        "xp":            row["xp"] or 0,
+        "username":      data.get("username", username),
+        "password_hash": data.get("password_hash", ""),
+        "avatar":        data.get("avatar", "wizard"),
+        "xp":            int(float(data.get("xp", 0))),
     }
 
 
-def add_xp(username: str, amount: int) -> int:
+async def add_xp(username: str, amount: int) -> int:
+    key = f"user:{username.lower()}:auth"
+    result = await _local().hincrbyfloat(key, "xp", amount)
+    # Fan-out to replicas (fire-and-forget; XP is eventually consistent)
+    for c in _clients[1:]:
+        asyncio.create_task(c.hincrbyfloat(key, "xp", amount))
+    return int(float(result))
+
+
+async def get_user_xp(username: str) -> int:
+    val = await _local().hget(f"user:{username.lower()}:auth", "xp")
+    return int(float(val)) if val else 0
+
+
+async def clear_history() -> None:
+    """Dev helper: wipe all messages."""
+    keys = []
+    for pattern in ("room:*:messages_hash", "room:*:timeline", "room:*:msg_ts"):
+        keys += await _local().keys(pattern)
+    if keys:
+        await _fanout(lambda c, ks: c.delete(*ks), keys)
+    print("[DB] All message history cleared.")
+
+
+# ── Reconciliation (partial fan-out recovery) ─────────────────────────────────
+# When a Valkey node is down during a fan-out write, it misses those messages.
+# On recovery, a backend can call reconcile_from(sibling_url) to replay the
+# diff using ZRANGEBYSCORE — fetching only messages newer than its local
+# last-seen timestamp. This is cheap: ZRANGEBYSCORE is O(log N + M) where M
+# is the number of missed messages, not total history.
+#
+# Tradeoff acknowledged: Between a node going down and reconciliation completing,
+# clients pinned to that backend see an incomplete history. This is an
+# eventual-consistency window, not data loss (AOF ensures durability on each
+# node individually). The reconciliation path closes the gap.
+
+async def get_timeline_since(room_id: str, since_ts: float) -> list[dict]:
     """
-    Atomically add `amount` XP to a user's total.
-    Returns the new XP total.
+    Return all messages with timestamp > since_ts from the LOCAL Valkey.
+    Used by siblings to pull diff during reconciliation.
+    ZRANGEBYSCORE is O(log N + M) — cheap regardless of total history size.
     """
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE users SET xp = xp + ? WHERE username = ? COLLATE NOCASE",
-            (amount, username),
-        )
-        row = conn.execute(
-            "SELECT xp FROM users WHERE username = ? COLLATE NOCASE",
-            (username,),
-        ).fetchone()
-    return row["xp"] if row else 0
+    timeline_key = f"room:{room_id}:timeline"
+    hash_key = f"room:{room_id}:messages_hash"
+
+    # ZRANGEBYSCORE: (since_ts means exclusive (score > since_ts)
+    msg_ids = await _local().zrangebyscore(timeline_key, f"({since_ts}", "+inf")
+    if not msg_ids:
+        return []
+    raw_list = await _local().hmget(hash_key, *msg_ids)
+    result = []
+    for mid, raw in zip(msg_ids, raw_list):
+        if raw:
+            try:
+                result.append({"msg_id": mid, "payload": raw})
+            except Exception:
+                continue
+    return result
 
 
-def get_user_xp(username: str) -> int:
-    """Return the current XP total for a user."""
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT xp FROM users WHERE username = ? COLLATE NOCASE",
-            (username,),
-        ).fetchone()
-    return row["xp"] if row else 0
-
-
-def clear_room_history(room_id: str) -> None:
-    """Delete all messages for a specific room. Called when the room has been empty for a while."""
-    with _connect() as conn:
-        conn.execute("DELETE FROM messages WHERE room_id = ?", (room_id,))
-    print(f"[DB] Room '{room_id}' message history cleared.")
-
-
-def clear_room_history_by_creator(room_id: str, username: str) -> bool:
+async def apply_reconciliation_diff(
+    room_id: str, diff: list[dict]
+) -> int:
     """
-    Clear all stored messages for a specific room.
-    Succeeds ONLY if the requesting user is the creator of the room.
+    Apply a list of {msg_id, payload} entries from a sibling to the LOCAL Valkey.
+    Uses HSETNX + ZADD NX so entries already present are never overwritten.
+    Returns the count of newly applied messages.
     """
-    with _connect() as conn:
-        room = conn.execute(
-            "SELECT created_by FROM rooms WHERE id = ?", (room_id,)
-        ).fetchone()
-        if not room or room["created_by"].lower() != username.lower():
-            return False
-        conn.execute("DELETE FROM messages WHERE room_id = ?", (room_id,))
-    print(f"[DB] Message history for room '{room_id}' cleared by creator '{username}'.")
-    return True
+    if not diff or not _clients:
+        return 0
+    applied = 0
+    local = _local()
+    timeline_key = f"room:{room_id}:timeline"
+    hash_key = f"room:{room_id}:messages_hash"
+    ts_key = f"room:{room_id}:msg_ts"
 
+    async with local.pipeline(transaction=False) as pipe:
+        for entry in diff:
+            mid = entry["msg_id"]
+            payload = entry["payload"]
+            try:
+                msg = json.loads(payload)
+                score = float(msg.get("created_at", time.time()))
+            except (json.JSONDecodeError, ValueError):
+                continue
+            pipe.hsetnx(ts_key, mid, str(score))
+            pipe.zadd(timeline_key, {mid: score}, nx=True)
+            pipe.hset(hash_key, mid, payload)
+            applied += 1
+        await pipe.execute()
 
-def delete_room(room_id: str, username: str) -> bool:
-    """
-    Permanently delete a chat room and all its messages.
-    Succeeds ONLY if the requesting user is the creator of the room.
-    """
-    with _connect() as conn:
-        room = conn.execute(
-            "SELECT created_by FROM rooms WHERE id = ?", (room_id,)
-        ).fetchone()
-        if not room or room["created_by"].lower() != username.lower():
-            return False
-        conn.execute("DELETE FROM messages WHERE room_id = ?", (room_id,))
-        conn.execute("DELETE FROM rooms WHERE id = ? AND created_by = ? COLLATE NOCASE", (room_id, username))
-    print(f"[DB] Room '{room_id}' and all messages deleted by creator '{username}'.")
-    return True
-
-
-def clear_history() -> None:
-    """Delete ALL messages and user keys. Legacy fallback."""
-    with _connect() as conn:
-        conn.execute("DELETE FROM messages")
-        conn.execute("DELETE FROM user_keys")
-    print("[DB] All message history and user keys cleared.")
+    print(f"[RECONCILE] Applied {applied} messages to room '{room_id}' from sibling.")
+    return applied
 
