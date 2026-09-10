@@ -394,52 +394,106 @@ def edit_message(
 
 # ── Simple load-test endpoints ────────────────────────────────────────────────
 
+_feed_cache: dict[str, tuple[float, str]] = {}
+_CACHE_TTL_SEC = 0.25  # 250ms micro-cache coalesces high-concurrency read spikes
+
 def save_message_simple(msg_id: str, room_id: str, username: str, text: str) -> bool:
     """
     Lightweight message store for the /message load-generator endpoint.
     Atomic dedup via HSETNX on the write client (primary).
-    Returns True on success, False on duplicate.
+    Stores pre-serialized JSON in Redis list for single-roundtrip /feed reads.
     """
     key = f"msg:{msg_id}"
     inserted = _rw.hsetnx(key, "username", username)
     if not inserted:
         return False  # duplicate
     ts = time.time()
+    msg_dict = {
+        "msg_id":      msg_id,
+        "client-name": username,
+        "msg":         text,
+        "timestamp":   str(ts),
+    }
+    msg_json = json.dumps(msg_dict)
+
     pipe = _rw.pipeline()
     pipe.hset(key, mapping={
         "room_id":   room_id,
         "text":      text,
         "timestamp": ts,
         "simple":    1,
+        "json":      msg_json,
     })
     pipe.zadd("feed:all", {msg_id: ts})
     pipe.zadd(f"feed:room:{room_id}", {msg_id: ts})
+    pipe.rpush(f"feed:list:{room_id}", msg_json)
     pipe.execute()
     return True
 
-def get_all_messages_simple(room_id: str = "loadtest") -> list[dict]:
+def get_feed_json(room_id: str = "loadtest") -> str:
     """
-    Return all messages in a room for the /feed endpoint.
-    Reads from the local replica — this is the hot read path that scales.
-    Returns all messages so the load tester can verify full correctness.
+    Return the complete /feed JSON string.
+    1. Micro-cache (250ms) absorbs concurrent reader bursts.
+    2. Fast path: 1 single Redis command (LRANGE) reading pre-serialized JSON.
+    3. Auto-backfills feed:list if unpopulated.
     """
+    now = time.time()
+    cached = _feed_cache.get(room_id)
+    if cached and (now - cached[0] < _CACHE_TTL_SEC):
+        return cached[1]
+
+    # Fast path: 1-command retrieval from Redis list
+    raw_list = _ro.lrange(f"feed:list:{room_id}", 0, -1)
+    if raw_list:
+        body = b"[" + b",".join(raw_list) + b"]"
+        json_str = body.decode("utf-8")
+        _feed_cache[room_id] = (now, json_str)
+        return json_str
+
+    # Fallback / Backfill path (for pre-existing unmigrated messages in Valkey)
     ids = _ro.zrange(f"feed:room:{room_id}", 0, -1)
+    if not ids:
+        empty_json = "[]"
+        _feed_cache[room_id] = (now, empty_json)
+        return empty_json
+
     pipe = _ro.pipeline()
     for mid in ids:
         pipe.hgetall(f"msg:{mid.decode()}")
     rows = pipe.execute()
-    result = []
+
+    items = []
+    pipe_backfill = _rw.pipeline()
     for mid, fields in zip(ids, rows):
         if not fields:
             continue
         f = {k.decode(): v.decode() for k, v in fields.items()}
-        result.append({
-            "msg_id":      mid.decode(),
-            "client-name": f.get("username", ""),
-            "msg":         f.get("text", ""),
-            "timestamp":   f.get("timestamp", ""),
-        })
-    return result
+        if "json" in f:
+            jstr = f["json"]
+        else:
+            jstr = json.dumps({
+                "msg_id":      mid.decode(),
+                "client-name": f.get("username", ""),
+                "msg":         f.get("text", ""),
+                "timestamp":   f.get("timestamp", ""),
+            })
+        items.append(jstr.encode("utf-8") if isinstance(jstr, str) else jstr)
+        pipe_backfill.rpush(f"feed:list:{room_id}", jstr)
+
+    try:
+        pipe_backfill.execute()
+    except Exception:
+        pass
+
+    body = b"[" + b",".join(items) + b"]"
+    json_str = body.decode("utf-8")
+    _feed_cache[room_id] = (now, json_str)
+    return json_str
+
+def get_all_messages_simple(room_id: str = "loadtest") -> list[dict]:
+    """Compatibility helper returning parsed Python dicts."""
+    return json.loads(get_feed_json(room_id))
+
 
 # ── User key registry ─────────────────────────────────────────────────────────
 

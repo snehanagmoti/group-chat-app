@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import bcrypt
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ConfigDict
@@ -316,13 +316,16 @@ async def submit_message(req: MessageRequest):
 
 
 @app.get("/feed")
-async def get_feed():
+def get_feed():
     """
     Official load-generator endpoint.
     Returns all messages in the global loadtest room, chronological order.
-    Shape: [{"msg_id": ..., "client-name": ..., "msg": ..., "timestamp": ...}, ...]
+    Uses sync def so FastAPI executes in worker threadpool without blocking async event loop.
+    Returns raw Response with pre-serialized JSON for maximum throughput.
     """
-    return db.get_all_messages_simple(room_id="loadtest")
+    raw_json = db.get_feed_json(room_id="loadtest")
+    return Response(content=raw_json, media_type="application/json")
+
 
 
 @app.get("/config.js")
