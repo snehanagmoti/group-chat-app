@@ -86,9 +86,9 @@ func (lb *LoadBalancer) bestBackend() *Backend {
 	var best *Backend
 	bestScore := math.MaxFloat64
 
-	// Pass 1: prefer non-overloaded, alive backends
+	// Pass 1: prefer non-overloaded, alive backends (or idle overloaded ones to prevent starvation)
 	for _, b := range lb.backends {
-		if !b.Alive.Load() || b.Overloaded.Load() {
+		if !b.Alive.Load() || (b.Overloaded.Load() && b.InFlight.Load() > 0) {
 			continue
 		}
 		if s := b.score(); s < bestScore {

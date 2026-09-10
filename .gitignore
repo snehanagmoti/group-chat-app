@@ -29,3 +29,5 @@ server/chat.db
 
 # SSL Certificates
 *.pem
+
+*.tex

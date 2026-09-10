@@ -1,0 +1,13 @@
+{
+  "experiment": "stress_monitored",
+  "users": 50,
+  "duration_sec": 120.012086071,
+  "successful": 8886,
+  "failed": 0,
+  "total": 8886,
+  "throughput_rps": 74.04254263810546,
+  "dropout_percent": 0,
+  "p50_ms": 27.714,
+  "p95_ms": 80.647,
+  "p99_ms": 112.202
+}

@@ -1,8 +1,11 @@
 # PixelChat — Secure Group Quest v2.0
 
-> **🌐 Live Deployment:** [https://10.1.75.51:3269/](https://10.1.75.51:3269/)
+> **🌐 Load Balancer (primary entry point):** `http://10.1.75.51:4273`
+> **📁 Frontend UI:** [https://10.1.75.51:3269/](https://10.1.75.51:3269/)
 
-A **real-time, secure, gamified group chat** built with **FastAPI WebSockets** (Python backend) and **Vanilla HTML/CSS/JS** (no frameworks), styled with a retro 8-bit pixel aesthetic. All messages are **end-to-end encrypted** using AES-GCM via the browser's Web Crypto API, **digitally signed** with ECDSA-P256, and **persisted encrypted** in an SQLite database with HMAC-SHA256 tamper detection.
+A **real-time, secure, gamified group chat** built with **FastAPI** (Python backend) and **Vanilla HTML/CSS/JS** (no frameworks), styled with a retro 8-bit pixel aesthetic. All messages are **end-to-end encrypted** using AES-GCM via the browser's Web Crypto API, **digitally signed** with ECDSA-P256, and **persisted encrypted** in a Valkey (Redis-compatible) database with HMAC-SHA256 tamper detection.
+
+The backend is deployed across **three systems** behind a custom **Go load balancer** using EWMA-based dynamic routing — automatically redistributing traffic when any backend becomes slow or unhealthy.
 
 ---
 
@@ -10,18 +13,20 @@ A **real-time, secure, gamified group chat** built with **FastAPI WebSockets** (
 
 1. [Features](#features)
 2. [Tech Stack](#tech-stack)
-3. [Architecture](#architecture)
-4. [Security & Encryption](#security--encryption)
-5. [Database Design](#database-design)
-6. [Gamification System](#gamification-system)
-7. [WebSocket Message Protocol](#websocket-message-protocol)
-8. [REST API Reference](#rest-api-reference)
-9. [File Attachment Support](#file-attachment-support)
-10. [Message Receipt System](#message-receipt-system)
-11. [Project Structure](#project-structure)
-12. [Environment Configuration](#environment-configuration)
-13. [Quick Start (Local)](#quick-start-local)
-14. [Multi-Machine Deployment](#multi-machine-deployment)
+3. [Deployment Architecture](#deployment-architecture)
+4. [Load Balancer (Go)](#load-balancer-go)
+5. [Load Generator](#load-generator)
+6. [Security & Encryption](#security--encryption)
+7. [Database Design](#database-design)
+8. [Gamification System](#gamification-system)
+9. [WebSocket Message Protocol](#websocket-message-protocol)
+10. [REST API Reference](#rest-api-reference)
+11. [File Attachment Support](#file-attachment-support)
+12. [Message Receipt System](#message-receipt-system)
+13. [Project Structure](#project-structure)
+14. [Environment Configuration](#environment-configuration)
+15. [Quick Start (Local)](#quick-start-local)
+16. [Lab Deployment (Multi-Machine)](#lab-deployment-multi-machine)
 
 ---
 
@@ -112,86 +117,178 @@ A **real-time, secure, gamified group chat** built with **FastAPI WebSockets** (
 
 ## Tech Stack
 
-| Layer        | Technology                                                                 |
-|--------------|----------------------------------------------------------------------------|
-| **Backend**  | Python 3.11+ · FastAPI · Uvicorn (ASGI) · SQLite3 · asyncio               |
-| **Security** | `cryptography` (ECDSA-P256) · `bcrypt` · `hmac` · `secrets` · `hashlib`   |
-| **Frontend** | HTML5 · Vanilla CSS · Vanilla JS (no frameworks, no build step)            |
-| **Crypto**   | Web Crypto API (`SubtleCrypto`) — AES-GCM 256-bit + ECDSA-P256            |
-| **Protocol** | WebSockets (RFC 6455) `wss://` · REST HTTP/HTTPS                           |
-| **Database** | SQLite (via Python built-in `sqlite3`)                                     |
-| **Fonts**    | Press Start 2P · VT323 (Google Fonts)                                      |
-| **TLS**      | Self-signed RSA-2048 certificate via Python `cryptography` library         |
+| Layer              | Technology                                                                      |
+|--------------------|---------------------------------------------------------------------------------|
+| **Backend**        | Python 3.11+ · FastAPI · Gunicorn (4 workers) · Uvicorn workers · asyncio      |
+| **Load Balancer**  | Go 1.21+ · `net/http` · `net/http/httputil` · EWMA dynamic routing             |
+| **Shared Storage** | Valkey (Redis-compatible) · Primary on Sys2 · Replicas on Sys3, Sys4           |
+| **Security**       | `cryptography` (ECDSA-P256) · `bcrypt` · `hmac` · `secrets` · `hashlib`        |
+| **Frontend**       | HTML5 · Vanilla CSS · Vanilla JS (no frameworks, no build step)                 |
+| **Crypto**         | Web Crypto API (`SubtleCrypto`) — AES-GCM 256-bit + ECDSA-P256                 |
+| **Protocol**       | WebSockets (RFC 6455) `wss://` · REST HTTP/HTTPS                                |
+| **Fonts**          | Press Start 2P · VT323 (Google Fonts)                                           |
+| **TLS**            | Self-signed RSA-2048 certificate via Python `cryptography` library              |
 
 ---
 
-## Architecture
+## Deployment Architecture
 
+### Lab System Layout
+
+```text
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                                LAB NETWORK (10.1.75.51)                                │
+│                                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ SYS1 (SSH :2273) — Ingress & Static Hosting                                      │  │
+│  │                                                                                  │  │
+│  │  ┌───────────────────────────────────────────────────┐  ┌─────────────────────┐  │  │
+│  │  │ Load Balancer (Go)                   :4273 (HTTP) │  │ Frontend     :3269  │  │  │
+│  │  │ · EWMA Dynamic Routing & Active Health Probes     │  │ · Static SPA (HTTPS)│  │  │
+│  │  │ · Connection Pool (64 idle) & Live /lb/status     │  │ · Web Crypto (E2EE) │  │  │
+│  │  └─────────────────────────┬─────────────────────────┘  └──────────▲──────────┘  │  │
+│  └────────────────────────────┼───────────────────────────────────────┼─────────────┘  │
+│                               │                                       │                │
+│               ┌───────────────┼───────────────┐                       │                │
+│               │ HTTPS         │ HTTPS         │ HTTPS                 │                │
+│               ▼               ▼               ▼                       │                │
+│        ┌───────────────┐┌───────────────┐┌───────────────┐            │                │
+│        │ SYS2 (:2274)  ││ SYS3 (:2275)  ││ SYS4 (:2276)  │            │                │
+│        │ Backend 1     ││ Backend 2     ││ Backend 3     │            │                │
+│        │ :5274 (HTTPS) ││ :5275 (HTTPS) ││ :5276 (HTTPS) │            │                │
+│        │ Gunicorn (4w) ││ Gunicorn (4w) ││ Gunicorn (4w) │            │                │
+│        │               ││               ││               │            │                │
+│        │ Valkey        ││ Valkey        ││ Valkey        │            │                │
+│        │ PRIMARY (rw)  ││ REPLICA (ro)  ││ REPLICA (ro)  │            │                │
+│        │ :6274         ││ :6000         ││ :6000         │            │                │
+│        └───────┬───────┘└───────▲───────┘└───────▲───────┘            │                │
+│                │                │                │                    │                │
+│                └─ Replication ──┴────────────────┘                    │                │
+│                   (Async Snapshot & Stream Sync)                      │                │
+└───────────────────────┼───────────────────────────────────────────────┼────────────────┘
+                        ▲                                               │
+               REST/WS  │ (HTTP :4273)                                  │ UI (:3269 HTTPS)
+                        │                                               │
+        ┌───────────────┴───────────────────────────────────────────────┴──────────────┐
+        │                                    CLIENTS                                   │
+        │   · Web Browsers (SubtleCrypto AES-GCM / ECDSA, WebSocket RFC 6455)          │
+        │   · Load Generator CLI (Go-based concurrent virtual users)                   │
+        └──────────────────────────────────────────────────────────────────────────────┘
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                          Machine (Server Host)                               │
-│                                                                              │
-│  ┌───────────────────────────┐       ┌───────────────────────────────────┐  │
-│  │   Frontend Server         │       │     Backend Server (FastAPI)      │  │
-│  │   client/serve.py         │       │     server/server.py              │  │
-│  │   https://0.0.0.0:3269    │       │     wss://0.0.0.0:PORT/ws         │  │
-│  │                           │       │                                   │  │
-│  │   Serves (HTTPS):         │       │   REST Endpoints:                 │  │
-│  │   ├── index.html          │       │   ├── POST /register              │  │
-│  │   ├── style.css           │       │   ├── POST /login                 │  │
-│  │   ├── app.js              │       │   ├── POST /refresh-token         │  │
-│  │   ├── config.js           │       │   ├── GET  /rooms                 │  │
-│  │   └── sounds/             │       │   ├── POST /rooms                 │  │
-│  │                           │       │   ├── GET  /rooms/{id}            │  │
-│  └───────────────────────────┘       │   ├── DELETE /rooms/{id}          │  │
-│                                      │   ├── DELETE /rooms/{id}/history  │  │
-│                                      │   ├── POST /upload                │  │
-│                                      │   ├── GET  /uploads/<file>        │  │
-│                                      │   ├── GET  /group-key             │  │
-│                                      │   ├── GET  /users/{name}/xp       │  │
-│                                      │   └── GET  /health                │  │
-│                                      │                                   │  │
-│                                      │   WebSocket /ws:                  │  │
-│                                      │   ├── join (token auth)           │  │
-│                                      │   ├── message (encrypt+sign)      │  │
-│                                      │   ├── typing                      │  │
-│                                      │   ├── edit_message                │  │
-│                                      │   ├── delete_message              │  │
-│                                      │   ├── heartbeat (XP)              │  │
-│                                      │   └── clear_room_history          │  │
-│                                      │                                   │  │
-│                                      │   ConnectionManager:              │  │
-│                                      │   ├── Multi-room WS registry      │  │
-│                                      │   ├── broadcast_to_room()         │  │
-│                                      │   ├── send_to_user_in_room()      │  │
-│                                      │   └── get_room_users()            │  │
-│                                      │                                   │  │
-│                                      │   Database (SQLite):              │  │
-│                                      │   ├── messages (encrypted+HMAC)   │  │
-│                                      │   ├── users (bcrypt hashes + XP)  │  │
-│                                      │   ├── rooms                       │  │
-│                                      │   └── user_keys (ECDSA JWKs)      │  │
-│                                      └───────────────────────────────────┘  │
-└──────────────────────────────┬───────────────────────────────────────────────┘
-                               │ HTTPS / WSS (TLS)
-              ┌────────────────┼───────────────────┐
-              │                │                   │
-       ┌──────┴──────┐  ┌──────┴──────┐   ┌───────┴──────┐
-       │  Browser 1  │  │  Browser 2  │   │  Browser N   │
-       │  (Player)   │  │  (Player)   │   │  (Player)    │
-       └─────────────┘  └─────────────┘   └──────────────┘
-```
+
+### Port Mapping
+
+Ports are derived from SSH port using: `App_N_Port = SSH_Port + (N × 1000)`
+
+| System | SSH Port | Role | External Port | Internal Port |
+|--------|----------|------|---------------|---------------|
+| Sys1   | 2273     | Load Balancer | 4273 | 4000 |
+| Sys2   | 2274     | Backend 1 / Valkey Primary | 5274 / 6274 | 5000 / 6000 |
+| Sys3   | 2275     | Backend 2 / Valkey Replica | 5275 | 5000 |
+| Sys4   | 2276     | Backend 3 / Valkey Replica | 5276 | 5000 |
 
 ### Component Responsibilities
 
 | Component | File | Role |
 |---|---|---|
-| **Backend Server** | `server/server.py` | FastAPI app: WebSocket hub, auth, room management, XP, ECDSA verification |
-| **Database Layer** | `server/db.py` | SQLite CRUD, HMAC computation/verification, schema migrations |
-| **Frontend Client** | `client/app.js` | WebSocket client, SubtleCrypto encryption, gamification, UI rendering |
+| **Load Balancer** | `load_balancer/main.go` | EWMA routing, health probes, `/lb/status`, `/lb/metrics` |
+| **Backend Server** | `server/server.py` | FastAPI app: REST API, WebSocket hub, auth, XP, ECDSA verification |
+| **Database Layer** | `server/db.py` | Valkey CRUD, HMAC tamper detection, 200-message feed cap |
+| **Frontend Client** | `client/app.js` | WebSocket client, SubtleCrypto encryption, gamification, UI |
 | **UI** | `client/index.html` + `client/style.css` | Three-screen SPA (Login → Lobby → Chat), retro pixel theme |
 | **Frontend Server** | `client/serve.py` | HTTPS static file server (FastAPI + uvicorn) |
+| **Load Generator** | `load_generator/load_gen` | Go-based concurrent load tester with EWMA-aware metrics |
+| **Monitor** | `monitor/monitor.py` | Per-system CPU/memory/network collector (psutil) |
 | **Certificate Generator** | `generate_certs.py` | Generates RSA-2048 self-signed TLS cert + key |
+
+---
+
+## Load Balancer (Go)
+
+The load balancer (`load_balancer/main.go`) is a Layer 7 HTTP reverse proxy written from scratch in Go using only the standard library.
+
+### EWMA-Based Dynamic Routing
+
+Traffic is distributed using an **Exponentially Weighted Moving Average** of per-backend response time:
+
+```
+score(b) = (InFlight(b) + 1) × EWMA(b)
+```
+
+The routing algorithm uses two passes:
+
+1. **Pass 1 — Best non-overloaded backend:** Selects the alive, non-overloaded backend with the lowest score (lowest queue depth × latency product).
+2. **Pass 2 — Fallback:** If all backends are overloaded, routes to the least busy alive backend to ensure progress.
+
+A backend is marked **overloaded** when its EWMA exceeds `--threshold-ms` (default 300 ms). The EWMA updates after every request:
+
+```
+EWMA_t = α × latency_t + (1 − α) × EWMA_{t−1}    (α = 0.3)
+```
+
+### Features
+
+- **Active health probes** — `GET /health` on each backend every 1 second; failed backends are automatically excluded
+- **Connection pooling** — shared `http.Transport` with 64 idle connections per backend host
+- **TLS passthrough** — `InsecureSkipVerify` for self-signed backend certificates
+- **Per-request timeout** — 800 ms hard deadline via `context.WithTimeout`
+- **Observability** — `/lb/health`, `/lb/status`, `/lb/metrics` endpoints
+
+### Startup Command
+
+```bash
+cd load_balancer
+./lb \
+  -addr :4000 \
+  -backends "https://10.1.75.51:5274,https://10.1.75.51:5275,https://10.1.75.51:5276" \
+  -threshold-ms 300 \
+  -ewma-alpha 0.3 \
+  -health-interval 1s \
+  -backend-timeout 800ms
+```
+
+### Build
+
+```bash
+cd load_balancer
+go build -o lb .
+```
+
+---
+
+## Load Generator
+
+A custom concurrent load generator (`load_generator/`) was built in Go to stress-test the system:
+
+```bash
+cd load_generator
+./load_gen \
+  -url http://10.1.75.51:4273 \
+  -users 50 -duration 120s \
+  -min-interval 100ms -max-interval 500ms \
+  -read-ratio 0.3 \
+  -experiment stress_50u -out results/
+```
+
+**Key features:**
+- Virtual users (goroutines), each with independent session state
+- Configurable read/write ratio (`-read-ratio`)
+- Randomised inter-request interval (avoids thundering herd)
+- Outputs: JSON summary, timeseries CSV, latency CDF CSV
+- Metrics: RPS, dropout %, p50/p95/p99 latency
+
+**Build:**
+```bash
+cd load_generator
+go build -o load_gen .
+```
+
+### Performance Results
+
+| Experiment | Users | Duration | RPS | Dropout | p50 | p95 | p99 |
+|---|---|---|---|---|---|---|---|
+| `baseline_20u_v3` | 20 | 60 s | 50.00 | 0.00% | 33 ms | 381 ms | 914 ms |
+| `stress_monitored` | 50 | 120 s | 74.04 | 0.00% | 28 ms | 81 ms | 112 ms |
 
 ---
 
@@ -487,8 +584,32 @@ group-chat-app/
 ├── generate_certs.py           # RSA-2048 self-signed TLS cert generator
 ├── cert.pem                    # TLS certificate (generated, gitignored)
 ├── key.pem                     # TLS private key (generated, gitignored)
-├── architecture_diagram.jpg    # System architecture reference image
-├── Lab 4.pdf                   # Assignment specification
+├── report_lab6.tex             # Lab 6 submission report (LaTeX)
+│
+├── load_balancer/              # Go EWMA load balancer
+│   ├── main.go                 # LB implementation (EWMA routing, health, proxy)
+│   └── lb                      # Compiled binary (gitignored)
+│
+├── load_generator/             # Go concurrent load testing tool
+│   ├── main.go                 # Virtual user load generator
+│   ├── load_gen                # Compiled binary (gitignored)
+│   └── results/                # Experiment outputs
+│       ├── *.json              # Per-experiment aggregate metrics
+│       ├── *_timeseries.csv    # Per-second RPS/latency timeseries
+│       ├── *_latencies.csv     # Per-request latency CDF data
+│       └── plots/              # Generated performance charts
+│           ├── response_time_cdf.png
+│           ├── throughput_timeseries.png
+│           ├── dropout_bar.png
+│           ├── sys_cpu.png
+│           ├── sys_mem.png
+│           └── sys_net.png
+│
+├── monitor/                    # System resource monitoring
+│   ├── monitor.py              # psutil collector (CPU, RAM, network)
+│   └── plot_results.py         # Matplotlib chart generator
+│
+├── valkey/                     # Valkey (Redis-compatible) config
 │
 ├── server/
 │   ├── server.py               # FastAPI WebSocket + REST API server
@@ -499,13 +620,11 @@ group-chat-app/
 │   │                           #   ├── ECDSA-P256 signature verification
 │   │                           #   ├── XP award logic (send/receive/join/heartbeat/streak)
 │   │                           #   └── File upload handler (/upload)
-│   ├── db.py                   # SQLite database layer
-│   │                           #   ├── Schema definition + migration helpers
+│   ├── db.py                   # Valkey database layer
 │   │                           #   ├── HMAC-SHA256 tamper detection
+│   │                           #   ├── 200-message feed cap (_FEED_LIMIT)
 │   │                           #   └── All CRUD functions (messages, users, rooms, keys)
-│   ├── requirements.txt        # Python dependencies
-│   ├── chat.db                 # SQLite database file (auto-created)
-│   └── uploads/                # Uploaded files served at /uploads/<uuid>.<ext>
+│   └── requirements.txt        # Python dependencies
 │
 └── client/
     ├── index.html              # Three-screen SPA (Login → Lobby → Chat)
@@ -570,61 +689,104 @@ pip install -r requirements.txt
 ### 2. Set Up Environment
 
 ```bash
-# From the project root
 cp .env.example .env
-# Edit .env — generate AES_GROUP_KEY and HMAC_SECRET as shown above
+# Edit .env — generate AES_GROUP_KEY and HMAC_SECRET
 ```
 
 ### 3. Generate TLS Certificates
 
 ```bash
-# From the project root
 python generate_certs.py
 # Outputs: cert.pem and key.pem
 ```
 
-> Required because `SubtleCrypto` only works in HTTPS contexts (secure origins).
+> Required because `SubtleCrypto` only works in HTTPS contexts.
 
-### 4. Start the Backend (Terminal 1)
+### 4. Start Valkey (Terminal 1)
+
+```bash
+sudo service valkey-server start
+# or: valkey-server --port 6000
+```
+
+### 5. Start the Backend (Terminal 2)
 
 ```bash
 cd server
-python3 server.py
+gunicorn server:app \
+  --workers 4 \
+  --worker-class uvicorn.workers.UvicornWorker \
+  --bind 0.0.0.0:5000 \
+  --certfile ../cert.pem \
+  --keyfile ../key.pem
 ```
 
-Server starts on configured `BACKEND_PORT`:
-- **WebSocket**: `wss://0.0.0.0:<BACKEND_PORT>/ws`
-- **API**: `https://0.0.0.0:<BACKEND_PORT>/rooms`, `/login`, `/register`, etc.
-- **Uploads**: `https://0.0.0.0:<BACKEND_PORT>/uploads/<file>`
-
-### 5. Start the Frontend (Terminal 2)
+### 6. Start the Frontend (Terminal 3)
 
 ```bash
 cd client
 python3 serve.py
 ```
 
-Serves the client at `https://0.0.0.0:<FRONTEND_PORT>`.
-
-### 6. Open in Browser
+### 7. Open in Browser
 
 ```
 https://localhost:<FRONTEND_PORT>
 ```
 
-> On first load, accept the self-signed certificate warning for **both** the frontend and backend ports. The app shows a guided overlay if the backend cert hasn't been accepted yet.
+> Accept the self-signed certificate for both frontend and backend ports on first load.
 
 ---
 
-## Multi-Machine Deployment
+## Lab Deployment (Multi-Machine)
 
-> **🌐 Deployed at:** [https://10.1.75.51:3269/](https://10.1.75.51:3269/)
+> **🌐 Load Balancer:** `http://10.1.75.51:4273`
+> **🖥️ Frontend:** `https://10.1.75.51:3269`
 
-1. **Server Machine** — Run both `server/server.py` and `client/serve.py`. Note the machine's LAN IP (`ip addr` on Linux).
-2. **All Client Machines** — Open `https://<SERVER_IP>:<FRONTEND_PORT>/` in any browser.
-3. The frontend fetches `/config.js` which injects `window.BACKEND_PORT`. The client derives the WebSocket URL as `wss://<same-hostname>:<BACKEND_PORT>/ws`. **No client-side configuration needed.**
+### On Sys2, Sys3, Sys4 (each backend)
 
-> New clients may need to accept the self-signed TLS cert for both ports on first visit. The app's certificate overlay guides users through this step automatically.
+```bash
+# 1. Start local Valkey replica (Sys3, Sys4 only — Sys2 is the primary)
+sudo service valkey-server restart
+
+# 2. Start backend with gunicorn
+cd ~/group-chat-app/server
+gunicorn server:app \
+  --workers 4 \
+  --worker-class uvicorn.workers.UvicornWorker \
+  --bind 0.0.0.0:5000 \
+  --certfile cert.pem \
+  --keyfile key.pem
+```
+
+### On Sys1 (load balancer + frontend)
+
+```bash
+# 1. Start load balancer
+cd ~/group-chat-app/load_balancer
+./lb \
+  -addr :4000 \
+  -backends "https://10.1.75.51:5274,https://10.1.75.51:5275,https://10.1.75.51:5276" \
+  -threshold-ms 300 \
+  -ewma-alpha 0.3 \
+  -health-interval 1s \
+  -backend-timeout 800ms
+
+# 2. Start frontend
+cd ~/group-chat-app/client
+python3 serve.py
+```
+
+### Verify deployment
+
+```bash
+# Check all backends are healthy
+curl http://10.1.75.51:4273/lb/status | python3 -m json.tool
+
+# Expect: all three backends alive=true, overloaded=false
+```
+
+> **Tip:** Always restart the LB before an evaluation to reset EWMA state to zero for all backends.
 
 ---
 
@@ -641,4 +803,6 @@ bcrypt
 
 ---
 
-*PixelChat — Group Quest v2.0 | CSD Lab 4*
+---
+
+*PixelChat — Group Quest v2.0 | CSD Lab 4 → Lab 6: Load Balanced Distributed Deployment*
