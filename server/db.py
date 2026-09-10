@@ -517,12 +517,18 @@ async def save_plain_message(client_name: str, msg: str, msg_id: str = "") -> st
     return msg_id
 
 
-async def get_feed() -> list[dict]:
+async def get_feed(limit: int = 200) -> list[dict]:
     """
-    Retrieve all plain-text messages for the GET /feed endpoint.
-    Served from LOCAL Valkey — in-memory, no network hop.
+    Retrieve the last `limit` plain-text messages for the GET /feed endpoint.
+    Served from LOCAL Valkey — in-memory, sub-millisecond latency.
+
+    Uses ZRANGE with negative indices (e.g. -200 to -1) to fetch only the
+    tail of the Sorted Set — O(log N + M) where M=limit, not total history.
+    Default limit is 200 — appropriate for a chat application where clients
+    only need recent context, not the full history since the dawn of time.
     """
-    msg_ids = await _local().zrange(f"room:{_FEED_ROOM}:timeline", 0, -1)
+    start_idx = -limit if limit > 0 else 0
+    msg_ids = await _local().zrange(f"room:{_FEED_ROOM}:timeline", start_idx, -1)
     if not msg_ids:
         return []
     raw_list = await _local().hmget(f"room:{_FEED_ROOM}:messages_hash", *msg_ids)

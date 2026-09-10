@@ -645,14 +645,22 @@ async def post_message(request: Request):
 
 
 @app.get("/feed")
-async def get_feed():
+async def get_feed(limit: int = 200):
     """
     GET /feed — Required by the assignment evaluator.
 
-    Returns all messages submitted via POST /message in chronological order.
+    Returns the last `limit` messages submitted via POST /message in
+    chronological order (oldest first within the window).
+
+    Query params:
+      limit  (int, default=200) — max messages to return.
+             For a chat app, clients only need recent context.
+             Capped at 1000 to prevent accidentally dumping huge histories.
+
     Served from the LOCAL Valkey instance — in-memory read, <1ms latency.
     """
-    messages = await db.get_feed()
+    limit = max(1, min(limit, 1000))   # clamp: 1 ≤ limit ≤ 1000
+    messages = await db.get_feed(limit=limit)
     return {"messages": messages, "count": len(messages)}
 
 
