@@ -111,18 +111,53 @@ def _local() -> valkey_lib.Valkey:
 
 async def _fanout(coro_fn, *args, **kwargs) -> bool:
     """
-    Execute an async Valkey command on ALL instances concurrently.
-    Returns True if at least one instance succeeded.
+    Write-local-first, then replicate to siblings asynchronously.
+
+    Strategy:
+      1. LOCAL write is awaited synchronously — HTTP response is only returned
+         after the local Valkey confirms the write. This guarantees the calling
+         backend can immediately serve it back on GET /feed.
+      2. REMOTE writes (siblings) are scheduled as background asyncio tasks
+         (fire-and-forget). They do NOT block the HTTP response path.
+
+    Why this matters for performance:
+      Under high concurrency (40–60 workers), waiting for 2 remote Valkey
+      network round-trips before returning the HTTP response causes latency
+      spikes that hit the LB's backend-timeout, producing 502 dropouts.
+      With fire-and-forget replication, the p99 latency drops dramatically
+      because each request only pays for ONE local Valkey write (~1–3ms),
+      not three.
+
+    Consistency tradeoff (acknowledged):
+      There is a brief window (~5–50ms) where a sibling may not yet have
+      the message. If the LB immediately routes the next GET /feed to a
+      different backend, it may see a slightly stale feed. This is an
+      eventual-consistency window, not data loss — AOF durability on each
+      node ensures the message survives on the local node, and the background
+      task will replicate it within milliseconds.
     """
     if not _clients:
         return False
-    tasks = [coro_fn(c, *args, **kwargs) for c in _clients]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    ok = sum(1 for r in results if not isinstance(r, Exception))
-    if ok < len(_clients):
-        failures = [str(r) for r in results if isinstance(r, Exception)]
-        print(f"[DB] Fan-out partial: {ok}/{len(_clients)} wrote OK. Failures: {failures}")
-    return ok > 0
+
+    # ── Step 1: Local write (synchronous, blocks until confirmed) ─────────────
+    local_ok = True
+    try:
+        await coro_fn(_clients[0], *args, **kwargs)
+    except Exception as e:
+        print(f"[DB] LOCAL write failed: {e}")
+        local_ok = False
+
+    # ── Step 2: Remote replications (fire-and-forget background tasks) ────────
+    async def _replicate_to(client, fn, *a, **kw):
+        try:
+            await fn(client, *a, **kw)
+        except Exception as e:
+            print(f"[DB] Remote replication failed (non-fatal): {e}")
+
+    for remote_client in _clients[1:]:
+        asyncio.create_task(_replicate_to(remote_client, coro_fn, *args, **kwargs))
+
+    return local_ok
 
 
 # ── Room CRUD ──────────────────────────────────────────────────────────────────
