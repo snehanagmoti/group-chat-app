@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -25,7 +26,7 @@ type Backend struct {
 	URL        *url.URL
 	Alive      atomic.Bool
 	InFlight   atomic.Int64
-	Overloaded atomic.Bool // true when EWMA > thresholdMs
+	Overloaded atomic.Bool            // true when EWMA > thresholdMs
 	proxy      *httputil.ReverseProxy // created once at startup; reused for every request
 
 	ewmaMu sync.Mutex
@@ -125,7 +126,9 @@ func (lb *LoadBalancer) healthLoop(interval time.Duration) {
 	}
 	for {
 		for _, b := range lb.backends {
+			probeStart := time.Now()
 			resp, err := client.Get(b.URL.String() + "/health")
+			probeLat := time.Since(probeStart)
 			if err != nil || resp.StatusCode >= 500 {
 				if b.Alive.Load() {
 					log.Printf("[health] backend %s -> UNHEALTHY", b.URL)
@@ -136,6 +139,8 @@ func (lb *LoadBalancer) healthLoop(interval time.Duration) {
 					log.Printf("[health] backend %s -> HEALTHY", b.URL)
 				}
 				b.Alive.Store(true)
+				// Record probe latency so EWMA actively decays when backend is responsive & idle
+				b.recordLatency(probeLat, lb.ewmaAlpha, lb.thresholdMs)
 			}
 			if resp != nil {
 				resp.Body.Close()
@@ -231,7 +236,7 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Delegate to the pre-created, connection-pooling reverse proxy
 	b.proxy.ServeHTTP(w, r)
 
-	if b.Alive.Load() {
+	if r.Context().Err() == nil && b.Alive.Load() {
 		lb.metrics.Success.Add(1)
 		elapsed := time.Since(start)
 		b.recordLatency(elapsed, lb.ewmaAlpha, lb.thresholdMs)
@@ -263,10 +268,10 @@ func main() {
 	healthInterval := flag.Duration("health-interval", 1*time.Second,
 		"how often to probe backend /health")
 
-	backendTimeout := flag.Duration("backend-timeout", 800*time.Millisecond,
+	backendTimeout := flag.Duration("backend-timeout", 2500*time.Millisecond,
 		"backend request timeout")
 
-	thresholdMs := flag.Float64("threshold-ms", 200,
+	thresholdMs := flag.Float64("threshold-ms", 300,
 		"EWMA ms above which backend is overloaded")
 
 	ewmaAlpha := flag.Float64("ewma-alpha", 0.2,
@@ -281,12 +286,12 @@ func main() {
 	//   - IdleConnTimeout      → evicts stale keep-alive connections after 90 s
 	//   - InsecureSkipVerify   → allows self-signed certs from the Python backend
 	sharedTransport := &http.Transport{
-		MaxIdleConns:        200,
-		MaxIdleConnsPerHost: 64,
+		MaxIdleConns:        1000,
+		MaxIdleConnsPerHost: 250,
 		IdleConnTimeout:     90 * time.Second,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		DialContext: (&net.Dialer{
-			Timeout:   *backendTimeout,
+			Timeout:   2 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ResponseHeaderTimeout: *backendTimeout,
@@ -312,10 +317,20 @@ func main() {
 		p := httputil.NewSingleHostReverseProxy(u)
 		p.Transport = sharedTransport
 		p.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-			b.Alive.Store(false)
+			isTimeout := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+			// Only mark dead if it's a real network connection failure, not high-load timeout
+			if !isTimeout {
+				b.Alive.Store(false)
+			}
+			b.Overloaded.Store(true)
+			b.recordLatency(lb.timeout, lb.ewmaAlpha, lb.thresholdMs)
 			lb.metrics.BackendErrors.Add(1)
 			lb.metrics.Failed.Add(1)
-			http.Error(rw, "backend unavailable", http.StatusBadGateway)
+			if isTimeout {
+				http.Error(rw, "backend busy/timeout", http.StatusGatewayTimeout)
+			} else {
+				http.Error(rw, "backend unavailable", http.StatusBadGateway)
+			}
 		}
 		b.proxy = p
 		b.Alive.Store(true)
