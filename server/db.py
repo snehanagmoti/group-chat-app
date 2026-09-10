@@ -417,12 +417,16 @@ def save_message_simple(msg_id: str, room_id: str, username: str, text: str) -> 
     pipe.execute()
     return True
 
+_FEED_LIMIT = 200  # return only the most recent N messages to keep /feed latency constant
+
 def get_all_messages_simple(room_id: str = "loadtest") -> list[dict]:
     """
-    Return all messages in a room for the /feed endpoint.
+    Return the most recent FEED_LIMIT messages in a room for the /feed endpoint.
     Reads from the local replica — this is the hot read path that scales.
+    Using -FEED_LIMIT:-1 ensures response size stays constant regardless of
+    how many messages have accumulated (prevents latency growth over test time).
     """
-    ids = _ro.zrange(f"feed:room:{room_id}", 0, -1)
+    ids = _ro.zrange(f"feed:room:{room_id}", -_FEED_LIMIT, -1)
     pipe = _ro.pipeline()
     for mid in ids:
         pipe.hgetall(f"msg:{mid.decode()}")

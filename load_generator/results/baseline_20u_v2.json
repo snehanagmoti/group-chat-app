@@ -1,0 +1,13 @@
+{
+  "experiment": "baseline_20u_v2",
+  "users": 20,
+  "duration_sec": 61.551820253,
+  "successful": 525,
+  "failed": 466,
+  "total": 991,
+  "throughput_rps": 8.529398445765896,
+  "dropout_percent": 47.023208879919274,
+  "p50_ms": 277.166,
+  "p95_ms": 1499.927,
+  "p99_ms": 1609.368
+}
