@@ -449,7 +449,8 @@ def save_message_simple(msg_id: str, room_id: str, username: str, text: str) -> 
     pipe.zadd("feed:all", {msg_id: ts})
     pipe.zadd(f"feed:room:{room_id}", {msg_id: ts})
     pipe.rpush(f"feed:list:{room_id}", msg_json)
-    pipe.execute()
+    results = pipe.execute(raise_on_error=True)  # surface OOM/errors instead of silently losing data
+    _ = results  # noqa: F841 (suppress unused-variable warning)
     return True
 
 def get_feed_json(room_id: str = "loadtest") -> str:

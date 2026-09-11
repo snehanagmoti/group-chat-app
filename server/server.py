@@ -219,8 +219,26 @@ class ConnectionManager:
 
 # ── FastAPI App ───────────────────────────────────────────────────────────────
 
+import anyio
+
 app = FastAPI(title="Secure Group Chat Server")
 manager = ConnectionManager()
+
+@app.on_event("startup")
+async def configure_threadpool():
+    """
+    Raise anyio's default thread limiter from 40 → 200.
+    FastAPI runs every plain `def` route handler in anyio's thread pool.
+    At 500 concurrent users across 3 backends, each backend sees ~167
+    concurrent requests; spread over 4 Gunicorn workers that's ~42 threads
+    per worker. The default cap of 40 would cause requests to queue behind
+    each other, effectively recreating the same serialisation bottleneck
+    that `async def` had. 200 gives headroom up to ~1600 concurrent users.
+    """
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    limiter.total_tokens = 200
+    print(f"[startup] anyio thread limiter set to {limiter.total_tokens}")
+
 
 # Per-room cleanup tasks: room_id → asyncio.Task
 cleanup_tasks: dict[str, asyncio.Task] = {}
@@ -295,13 +313,18 @@ async def startup():
 # ── Load Balancer / Evaluator Endpoints ────────────────────────────────────────
 
 @app.post("/message")
-async def submit_message(req: MessageRequest):
+def submit_message(req: MessageRequest):
     """
     Official load-generator endpoint.
-    Stores a plain-text message in the shared Valkey store.
-    Uses client-provided msg_id if present (enables dedup on retry),
-    otherwise server generates a UUID4.
-    Returns {"status": "ok", "msg_id": "<uuid>"} or {"status": "duplicate"}.
+    Plain `def` (not async) so FastAPI/Starlette automatically runs this in
+    anyio's thread pool. This means the Redis pipeline calls are genuinely
+    concurrent: multiple requests execute their I/O in separate threads while
+    the event loop stays free to accept new connections and serve /health.
+
+    With `async def`, every Redis call would block the single event loop
+    thread — serialising ALL concurrent requests on this worker behind the
+    latency of a single Redis round-trip (~1-3ms), which causes 99% timeouts
+    at 500 users. Same fix as /feed above.
     """
     msg_id = req.msg_id.strip() if req.msg_id.strip() else str(uuid.uuid4())
     saved = db.save_message_simple(
@@ -313,6 +336,7 @@ async def submit_message(req: MessageRequest):
     if saved:
         return {"status": "ok", "msg_id": msg_id}
     return {"status": "duplicate", "msg_id": msg_id}
+
 
 
 
