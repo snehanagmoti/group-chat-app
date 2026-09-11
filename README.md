@@ -716,7 +716,9 @@ gunicorn server:app \
   --worker-class uvicorn.workers.UvicornWorker \
   --bind 0.0.0.0:5000 \
   --certfile ../cert.pem \
-  --keyfile ../key.pem
+  --keyfile ../key.pem \
+  --timeout 120 \
+  --graceful-timeout 30
 ```
 
 ### 6. Start the Frontend (Terminal 3)
@@ -754,7 +756,9 @@ gunicorn server:app \
   --worker-class uvicorn.workers.UvicornWorker \
   --bind 0.0.0.0:5000 \
   --certfile cert.pem \
-  --keyfile key.pem
+  --keyfile key.pem \
+  --timeout 120 \
+  --graceful-timeout 30
 ```
 
 ### On Sys1 (load balancer + frontend)

@@ -525,8 +525,21 @@ func main() {
 					isTimeout = true
 				}
 			}
-			// Only mark dead if it's a real network connection failure, not high-load timeout
-			if !isTimeout {
+
+			// Under high load, an overloaded Gunicorn sends TCP RST (connection
+			// refused) or closes the connection mid-stream (EOF/unexpected EOF).
+			// These are transient overload signals — not a dead server — so treat
+			// them the same as timeouts: error cooldown rather than marking dead.
+			// Only truly dead backends (refused to TLS-handshake, bad cert, etc.)
+			// should be permanently removed from rotation.
+			errStr := err.Error()
+			isTransient := isTimeout ||
+				strings.Contains(errStr, "connection refused") ||
+				strings.Contains(errStr, "EOF") ||
+				strings.Contains(errStr, "reset by peer") ||
+				strings.Contains(errStr, "broken pipe")
+
+			if !isTransient {
 				b.Alive.Store(false)
 			}
 			// IMPORTANT: do NOT call b.recordLatency(lb.timeout, ...) here. Feeding the

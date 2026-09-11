@@ -54,7 +54,7 @@ _replica_url = os.environ.get("VALKEY_REPLICA_URL", _primary_url)
 _rw = redis.from_url(
     _primary_url,
     decode_responses=False,
-    socket_timeout=2,
+    socket_timeout=10,         # large enough for LRANGE of 5000+ entries under load
     socket_connect_timeout=2,
     health_check_interval=30,
     retry_on_timeout=True,
@@ -64,7 +64,7 @@ _rw = redis.from_url(
 _ro = redis.from_url(
     _replica_url,
     decode_responses=False,
-    socket_timeout=2,
+    socket_timeout=10,         # large enough for LRANGE of 5000+ entries under load
     socket_connect_timeout=2,
     health_check_interval=30,
     retry_on_timeout=True,
