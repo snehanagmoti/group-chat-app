@@ -304,13 +304,7 @@ async def submit_message(req: MessageRequest):
     Returns {"status": "ok", "msg_id": "<uuid>"} or {"status": "duplicate"}.
     """
     msg_id = req.msg_id.strip() if req.msg_id.strip() else str(uuid.uuid4())
-    # db.save_message_simple uses the synchronous redis-py client, which blocks.
-    # Called directly inside this async handler it would stall this worker's
-    # entire event loop for every request, serializing all concurrent traffic
-    # landing on it (even with multiple gunicorn workers, each worker's own
-    # event loop still blocks). Run it in the threadpool instead.
-    saved = await asyncio.to_thread(
-        db.save_message_simple,
+    saved = db.save_message_simple(
         msg_id=msg_id,
         room_id="loadtest",
         username=req.client_name,
@@ -319,6 +313,7 @@ async def submit_message(req: MessageRequest):
     if saved:
         return {"status": "ok", "msg_id": msg_id}
     return {"status": "duplicate", "msg_id": msg_id}
+
 
 
 @app.get("/feed")
