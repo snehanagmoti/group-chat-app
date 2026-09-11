@@ -436,6 +436,15 @@ def get_feed_json(room_id: str = "loadtest") -> str:
     1. Micro-cache (250ms) absorbs concurrent reader bursts.
     2. Fast path: 1 single Redis command (LRANGE) reading pre-serialized JSON.
     3. Auto-backfills feed:list if unpopulated.
+
+    NOTE: reads from _rw (primary), not _ro (replica). This deployment runs
+    the LB round-robining across 3 backend containers (1 fronting the primary,
+    2 fronting replicas). A write on one container's primary connection can
+    lag behind on another container's replica connection, so a POST /message
+    immediately followed by a GET /feed against a different backend could miss
+    the just-written message. /message and /feed are the exact load-tested
+    endpoints, so they read-your-writes off primary; everything else in this
+    file (room lookups, chat history, etc.) still reads from the replica.
     """
     now = time.time()
     cached = _feed_cache.get(room_id)
@@ -443,7 +452,7 @@ def get_feed_json(room_id: str = "loadtest") -> str:
         return cached[1]
 
     # Fast path: 1-command retrieval from Redis list
-    raw_list = _ro.lrange(f"feed:list:{room_id}", 0, -1)
+    raw_list = _rw.lrange(f"feed:list:{room_id}", 0, -1)
     if raw_list:
         body = b"[" + b",".join(raw_list) + b"]"
         json_str = body.decode("utf-8")
@@ -451,13 +460,13 @@ def get_feed_json(room_id: str = "loadtest") -> str:
         return json_str
 
     # Fallback / Backfill path (for pre-existing unmigrated messages in Valkey)
-    ids = _ro.zrange(f"feed:room:{room_id}", 0, -1)
+    ids = _rw.zrange(f"feed:room:{room_id}", 0, -1)
     if not ids:
         empty_json = "[]"
         _feed_cache[room_id] = (now, empty_json)
         return empty_json
 
-    pipe = _ro.pipeline()
+    pipe = _rw.pipeline()
     for mid in ids:
         pipe.hgetall(f"msg:{mid.decode()}")
     rows = pipe.execute()

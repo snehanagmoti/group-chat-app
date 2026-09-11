@@ -61,6 +61,21 @@ func (b *Backend) getEWMA() float64 {
 	return b.ewmaMs
 }
 
+// decayIdle ages the EWMA toward zero as if a fast (0ms) sample had arrived.
+// Used by the health-check loop so a healthy, idle backend's latency signal
+// recovers over time WITHOUT mixing raw health-probe latency (typically 1-5ms)
+// into the same average as real request latency — the two are not comparable
+// and blending them previously masked genuine overload.
+func (b *Backend) decayIdle(alpha, thresholdMs float64) {
+	b.ewmaMu.Lock()
+	defer b.ewmaMu.Unlock()
+	if b.ewmaMs == 0 {
+		return
+	}
+	b.ewmaMs = (1 - alpha) * b.ewmaMs
+	b.Overloaded.Store(b.ewmaMs > thresholdMs)
+}
+
 // ─── Metrics ──────────────────────────────────────────────────────────────────
 
 type Metrics struct {
@@ -70,7 +85,37 @@ type Metrics struct {
 	BackendErrors atomic.Uint64
 
 	LatencyMu sync.Mutex
-	Latencies []time.Duration
+	Latencies []time.Duration // fixed-capacity ring buffer, see recordLatencySample
+	latIdx    int
+	latFilled bool
+}
+
+const latencyBufferCap = 2000 // bounds memory + sort cost regardless of request volume
+
+func (m *Metrics) recordLatencySample(d time.Duration) {
+	m.LatencyMu.Lock()
+	defer m.LatencyMu.Unlock()
+	if m.Latencies == nil {
+		m.Latencies = make([]time.Duration, latencyBufferCap)
+	}
+	m.Latencies[m.latIdx] = d
+	m.latIdx = (m.latIdx + 1) % latencyBufferCap
+	if m.latIdx == 0 {
+		m.latFilled = true
+	}
+}
+
+// snapshotLatencies returns a copy of the samples currently in the ring buffer.
+func (m *Metrics) snapshotLatencies() []time.Duration {
+	m.LatencyMu.Lock()
+	defer m.LatencyMu.Unlock()
+	n := m.latIdx
+	if m.latFilled {
+		n = latencyBufferCap
+	}
+	cp := make([]time.Duration, n)
+	copy(cp, m.Latencies[:n])
+	return cp
 }
 
 // ─── LoadBalancer ─────────────────────────────────────────────────────────────
@@ -128,7 +173,7 @@ func (lb *LoadBalancer) healthLoop(interval time.Duration) {
 		for _, b := range lb.backends {
 			probeStart := time.Now()
 			resp, err := client.Get(b.URL.String() + "/health")
-			probeLat := time.Since(probeStart)
+			_ = time.Since(probeStart) // probe latency is a liveness signal only, not a request-latency sample
 			if err != nil || resp.StatusCode >= 500 {
 				if b.Alive.Load() {
 					log.Printf("[health] backend %s -> UNHEALTHY", b.URL)
@@ -139,8 +184,12 @@ func (lb *LoadBalancer) healthLoop(interval time.Duration) {
 					log.Printf("[health] backend %s -> HEALTHY", b.URL)
 				}
 				b.Alive.Store(true)
-				// Record probe latency so EWMA actively decays when backend is responsive & idle
-				b.recordLatency(probeLat, lb.ewmaAlpha, lb.thresholdMs)
+				// Only decay the EWMA when the backend is genuinely idle — if it has
+				// in-flight requests, real request latency should drive the signal,
+				// not a fast /health ping that bypasses whatever is slowing real traffic.
+				if b.InFlight.Load() == 0 {
+					b.decayIdle(lb.ewmaAlpha, lb.thresholdMs)
+				}
 			}
 			if resp != nil {
 				resp.Body.Close()
@@ -183,10 +232,7 @@ func (lb *LoadBalancer) statusHandler(w http.ResponseWriter, r *http.Request) {
 
 // metricsHandler: GET /lb/metrics
 func (lb *LoadBalancer) metricsHandler(w http.ResponseWriter, r *http.Request) {
-	lb.metrics.LatencyMu.Lock()
-	cp := make([]time.Duration, len(lb.metrics.Latencies))
-	copy(cp, lb.metrics.Latencies)
-	lb.metrics.LatencyMu.Unlock()
+	cp := lb.metrics.snapshotLatencies()
 
 	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
 
@@ -240,9 +286,7 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		lb.metrics.Success.Add(1)
 		elapsed := time.Since(start)
 		b.recordLatency(elapsed, lb.ewmaAlpha, lb.thresholdMs)
-		lb.metrics.LatencyMu.Lock()
-		lb.metrics.Latencies = append(lb.metrics.Latencies, elapsed)
-		lb.metrics.LatencyMu.Unlock()
+		lb.metrics.recordLatencySample(elapsed)
 	}
 }
 
@@ -288,13 +332,21 @@ func main() {
 	sharedTransport := &http.Transport{
 		MaxIdleConns:        1000,
 		MaxIdleConnsPerHost: 250,
+		MaxConnsPerHost:     500, // bound total (not just idle) conns per backend so a burst can't open unlimited sockets
 		IdleConnTimeout:     90 * time.Second,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		DialContext: (&net.Dialer{
 			Timeout:   2 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		ResponseHeaderTimeout: *backendTimeout,
+		// NOTE: deliberately no ResponseHeaderTimeout here. It used to be set to the
+		// same duration as the per-request context timeout below, so the two raced —
+		// whichever fired first produced a differently-shaped error. When
+		// ResponseHeaderTimeout won the race it returned Go's internal
+		// "timeout awaiting response headers" error, which errors.Is() does NOT
+		// recognize as context.DeadlineExceeded, so the ErrorHandler misclassified
+		// a merely-slow-but-alive backend as dead. The per-request context deadline
+		// (lb.timeout) is now the single source of truth for request timeouts.
 	}
 
 	lb := &LoadBalancer{
@@ -318,6 +370,14 @@ func main() {
 		p.Transport = sharedTransport
 		p.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 			isTimeout := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+			if !isTimeout {
+				// Catches timeouts that don't wrap a context error (e.g. transport-level
+				// timeouts), so any kind of "too slow" is treated as busy, not dead.
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					isTimeout = true
+				}
+			}
 			// Only mark dead if it's a real network connection failure, not high-load timeout
 			if !isTimeout {
 				b.Alive.Store(false)
