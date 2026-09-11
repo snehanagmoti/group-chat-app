@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
 	"net/url"
 	"sort"
@@ -102,45 +103,75 @@ func (b *Backend) decayIdle(alpha, thresholdMs float64) {
 
 // ─── Metrics ──────────────────────────────────────────────────────────────────
 
+const latencyBufferCap = 2000 // bounds memory + sort cost regardless of request volume
+
+// latencyRing is a small fixed-capacity ring buffer of durations, guarded by
+// its own mutex. Used for several independent latency signals below so each
+// can be sampled/percentiled without one polluting another.
+type latencyRing struct {
+	mu     sync.Mutex
+	values []time.Duration
+	idx    int
+	filled bool
+}
+
+func (r *latencyRing) record(d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.values == nil {
+		r.values = make([]time.Duration, latencyBufferCap)
+	}
+	r.values[r.idx] = d
+	r.idx = (r.idx + 1) % latencyBufferCap
+	if r.idx == 0 {
+		r.filled = true
+	}
+}
+
+// snapshot returns a copy of the samples currently in the ring buffer.
+func (r *latencyRing) snapshot() []time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := r.idx
+	if r.filled {
+		n = latencyBufferCap
+	}
+	cp := make([]time.Duration, n)
+	copy(cp, r.values[:n])
+	return cp
+}
+
 type Metrics struct {
 	Total         atomic.Uint64
 	Success       atomic.Uint64
 	Failed        atomic.Uint64
 	BackendErrors atomic.Uint64
 
-	LatencyMu sync.Mutex
-	Latencies []time.Duration // fixed-capacity ring buffer, see recordLatencySample
-	latIdx    int
-	latFilled bool
+	// Latencies is the total, client-observed request latency: connection
+	// acquisition (queueing on the pool) + backend processing time. This is
+	// what a load-test tool sees, so it stays as the headline p50/p95/p99.
+	Latencies latencyRing
+
+	// QueueWait is time spent waiting to acquire a connection from the
+	// shared transport's pool (MaxConnsPerHost) before the request could
+	// even be sent to the backend. Tracked separately so it can be told
+	// apart from genuine backend slowness — see ServeHTTP.
+	QueueWait latencyRing
+
+	// BackendOnly is Latencies minus QueueWait: the portion of each request
+	// actually spent waiting on the backend. This — not the total — is what
+	// feeds each Backend's EWMA, so pool contention can't be misread as the
+	// backend itself being slow.
+	BackendOnly latencyRing
 }
 
-const latencyBufferCap = 2000 // bounds memory + sort cost regardless of request volume
+func (m *Metrics) recordLatencySample(d time.Duration)     { m.Latencies.record(d) }
+func (m *Metrics) recordQueueWaitSample(d time.Duration)   { m.QueueWait.record(d) }
+func (m *Metrics) recordBackendOnlySample(d time.Duration) { m.BackendOnly.record(d) }
 
-func (m *Metrics) recordLatencySample(d time.Duration) {
-	m.LatencyMu.Lock()
-	defer m.LatencyMu.Unlock()
-	if m.Latencies == nil {
-		m.Latencies = make([]time.Duration, latencyBufferCap)
-	}
-	m.Latencies[m.latIdx] = d
-	m.latIdx = (m.latIdx + 1) % latencyBufferCap
-	if m.latIdx == 0 {
-		m.latFilled = true
-	}
-}
-
-// snapshotLatencies returns a copy of the samples currently in the ring buffer.
-func (m *Metrics) snapshotLatencies() []time.Duration {
-	m.LatencyMu.Lock()
-	defer m.LatencyMu.Unlock()
-	n := m.latIdx
-	if m.latFilled {
-		n = latencyBufferCap
-	}
-	cp := make([]time.Duration, n)
-	copy(cp, m.Latencies[:n])
-	return cp
-}
+func (m *Metrics) snapshotLatencies() []time.Duration   { return m.Latencies.snapshot() }
+func (m *Metrics) snapshotQueueWait() []time.Duration   { return m.QueueWait.snapshot() }
+func (m *Metrics) snapshotBackendOnly() []time.Duration { return m.BackendOnly.snapshot() }
 
 // ─── LoadBalancer ─────────────────────────────────────────────────────────────
 
@@ -195,31 +226,45 @@ func (lb *LoadBalancer) healthLoop(interval time.Duration) {
 		},
 	}
 	for {
+		// Fire all probes concurrently. Previously each backend was probed
+		// sequentially in this single goroutine with up to a 2s client
+		// timeout apiece — one slow/unreachable backend could delay the
+		// UNHEALTHY/HEALTHY detection of every backend behind it in the
+		// list by seconds. A WaitGroup lets every probe run in parallel so
+		// the tick's total duration is bounded by the slowest single probe,
+		// not the sum of all of them.
+		var wg sync.WaitGroup
 		for _, b := range lb.backends {
-			probeStart := time.Now()
-			resp, err := client.Get(b.URL.String() + "/health")
-			_ = time.Since(probeStart) // probe latency is a liveness signal only, not a request-latency sample
-			if err != nil || resp.StatusCode >= 500 {
-				if b.Alive.Load() {
-					log.Printf("[health] backend %s -> UNHEALTHY", b.URL)
+			wg.Add(1)
+			go func(b *Backend) {
+				defer wg.Done()
+
+				probeStart := time.Now()
+				resp, err := client.Get(b.URL.String() + "/health")
+				_ = time.Since(probeStart) // probe latency is a liveness signal only, not a request-latency sample
+				if err != nil || resp.StatusCode >= 500 {
+					if b.Alive.Load() {
+						log.Printf("[health] backend %s -> UNHEALTHY", b.URL)
+					}
+					b.Alive.Store(false)
+				} else {
+					if !b.Alive.Load() {
+						log.Printf("[health] backend %s -> HEALTHY", b.URL)
+					}
+					b.Alive.Store(true)
+					// Only decay the EWMA when the backend is genuinely idle — if it has
+					// in-flight requests, real request latency should drive the signal,
+					// not a fast /health ping that bypasses whatever is slowing real traffic.
+					if b.InFlight.Load() == 0 {
+						b.decayIdle(lb.ewmaAlpha, lb.thresholdMs)
+					}
 				}
-				b.Alive.Store(false)
-			} else {
-				if !b.Alive.Load() {
-					log.Printf("[health] backend %s -> HEALTHY", b.URL)
+				if resp != nil {
+					resp.Body.Close()
 				}
-				b.Alive.Store(true)
-				// Only decay the EWMA when the backend is genuinely idle — if it has
-				// in-flight requests, real request latency should drive the signal,
-				// not a fast /health ping that bypasses whatever is slowing real traffic.
-				if b.InFlight.Load() == 0 {
-					b.decayIdle(lb.ewmaAlpha, lb.thresholdMs)
-				}
-			}
-			if resp != nil {
-				resp.Body.Close()
-			}
+			}(b)
 		}
+		wg.Wait()
 		time.Sleep(interval)
 	}
 }
@@ -261,9 +306,13 @@ func (lb *LoadBalancer) statusHandler(w http.ResponseWriter, r *http.Request) {
 
 // metricsHandler: GET /lb/metrics
 func (lb *LoadBalancer) metricsHandler(w http.ResponseWriter, r *http.Request) {
-	cp := lb.metrics.snapshotLatencies()
+	total := lb.metrics.snapshotLatencies()
+	queueWait := lb.metrics.snapshotQueueWait()
+	backendOnly := lb.metrics.snapshotBackendOnly()
 
-	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
+	sort.Slice(total, func(i, j int) bool { return total[i] < total[j] })
+	sort.Slice(queueWait, func(i, j int) bool { return queueWait[i] < queueWait[j] })
+	sort.Slice(backendOnly, func(i, j int) bool { return backendOnly[i] < backendOnly[j] })
 
 	overloadedCount := 0
 	for _, b := range lb.backends {
@@ -274,13 +323,24 @@ func (lb *LoadBalancer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"total":               lb.metrics.Total.Load(),
-		"success":             lb.metrics.Success.Load(),
-		"failed":              lb.metrics.Failed.Load(),
-		"backend_errors":      lb.metrics.BackendErrors.Load(),
-		"p50_ms":              percentile(cp, 50).Milliseconds(),
-		"p95_ms":              percentile(cp, 95).Milliseconds(),
-		"p99_ms":              percentile(cp, 99).Milliseconds(),
+		"total":          lb.metrics.Total.Load(),
+		"success":        lb.metrics.Success.Load(),
+		"failed":         lb.metrics.Failed.Load(),
+		"backend_errors": lb.metrics.BackendErrors.Load(),
+		"p50_ms":         percentile(total, 50).Milliseconds(),
+		"p95_ms":         percentile(total, 95).Milliseconds(),
+		"p99_ms":         percentile(total, 99).Milliseconds(),
+		// Breakdown of the total above: how much was spent waiting on a free
+		// pooled connection (pool contention) vs. actually waiting on the
+		// backend. If queue_wait tracks your load generator's concurrency
+		// rather than backend p50_ms, the bottleneck is MaxConnsPerHost /
+		// MaxIdleConnsPerHost, not the backends themselves.
+		"queue_wait_p50_ms":   percentile(queueWait, 50).Milliseconds(),
+		"queue_wait_p95_ms":   percentile(queueWait, 95).Milliseconds(),
+		"queue_wait_p99_ms":   percentile(queueWait, 99).Milliseconds(),
+		"backend_only_p50_ms": percentile(backendOnly, 50).Milliseconds(),
+		"backend_only_p95_ms": percentile(backendOnly, 95).Milliseconds(),
+		"backend_only_p99_ms": percentile(backendOnly, 99).Milliseconds(),
 		"threshold_ms":        lb.thresholdMs,
 		"ewma_alpha":          lb.ewmaAlpha,
 		"overloaded_backends": overloadedCount,
@@ -306,6 +366,23 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Apply per-request timeout via context
 	ctx, cancel := context.WithTimeout(r.Context(), lb.timeout)
 	defer cancel()
+
+	// Instrument the round trip so we can tell apart two very different
+	// costs that both used to land in one "elapsed" number:
+	//   - queue wait: time blocked waiting for a free connection out of the
+	//     shared transport's pool (MaxConnsPerHost), or the time spent
+	//     dialing a brand-new one. This is pool contention, not the backend
+	//     being slow.
+	//   - backend time: everything after a connection was actually in hand
+	//     — i.e. the backend really processing the request.
+	// GetConn fires right before the transport tries to obtain a
+	// connection; GotConn fires once it has one (reused or freshly dialed).
+	var getConnAt, gotConnAt time.Time
+	trace := &httptrace.ClientTrace{
+		GetConn: func(hostPort string) { getConnAt = time.Now() },
+		GotConn: func(info httptrace.GotConnInfo) { gotConnAt = time.Now() },
+	}
+	ctx = httptrace.WithClientTrace(ctx, trace)
 	r = r.WithContext(ctx)
 
 	// Delegate to the pre-created, connection-pooling reverse proxy
@@ -314,8 +391,30 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Context().Err() == nil && b.Alive.Load() {
 		lb.metrics.Success.Add(1)
 		elapsed := time.Since(start)
-		b.recordLatency(elapsed, lb.ewmaAlpha, lb.thresholdMs)
+
+		var queueWait time.Duration
+		if !getConnAt.IsZero() && !gotConnAt.IsZero() {
+			queueWait = gotConnAt.Sub(getConnAt)
+		}
+		backendOnly := elapsed - queueWait
+		if backendOnly < 0 { // defensive; shouldn't happen but never let EWMA go negative
+			backendOnly = elapsed
+		}
+
+		// EWMA (and therefore bestBackend()'s routing decisions) is driven
+		// ONLY by backend-only time now, so time spent queued for a
+		// connection out of the pool can't be misattributed to the backend
+		// being slow and needlessly steer traffic away from a backend that
+		// is actually healthy.
+		b.recordLatency(backendOnly, lb.ewmaAlpha, lb.thresholdMs)
+
+		// Total client-observed latency stays the headline metric (it's what
+		// a load-test tool actually measures), with the two components also
+		// tracked separately so /lb/metrics can show whether latency is
+		// coming from backend processing or from pool queueing.
 		lb.metrics.recordLatencySample(elapsed)
+		lb.metrics.recordQueueWaitSample(queueWait)
+		lb.metrics.recordBackendOnlySample(backendOnly)
 	}
 }
 
@@ -353,6 +452,12 @@ func main() {
 	errorCooldown := flag.Duration("error-cooldown", 3*time.Second,
 		"how long a backend is treated as overloaded after an error/timeout, independent of latency EWMA")
 
+	maxConnsPerHost := flag.Int("max-conns-per-host", 500,
+		"max concurrent connections per backend; set this >= (target concurrent virtual users / number of backends) or requests queue for a pooled connection and that queueing shows up as latency (see /lb/metrics queue_wait_*)")
+
+	maxIdleConnsPerHost := flag.Int("max-idle-conns-per-host", 250,
+		"idle keep-alive connections kept warm per backend")
+
 	flag.Parse()
 
 	// Build backend list with pre-created connection-pooling proxies
@@ -361,10 +466,19 @@ func main() {
 	//   - MaxIdleConnsPerHost  → keeps TCP connections warm (avoids TCP handshake on every request)
 	//   - IdleConnTimeout      → evicts stale keep-alive connections after 90 s
 	//   - InsecureSkipVerify   → allows self-signed certs from the Python backend
+	//
+	// MaxConnsPerHost is the hard cap on connections in flight to ANY ONE
+	// backend. Once that many requests to a backend are outstanding, the
+	// transport queues further requests until a connection frees up —
+	// that queueing time is measured separately in ServeHTTP and reported
+	// as queue_wait_* in /lb/metrics precisely so it isn't mistaken for the
+	// backend being slow. Size this flag for your actual test concurrency:
+	// e.g. 500 virtual users spread over 2 backends needs >=250 here per
+	// backend, not 500 total capacity shared unevenly.
 	sharedTransport := &http.Transport{
 		MaxIdleConns:        1000,
-		MaxIdleConnsPerHost: 250,
-		MaxConnsPerHost:     500, // bound total (not just idle) conns per backend so a burst can't open unlimited sockets
+		MaxIdleConnsPerHost: *maxIdleConnsPerHost,
+		MaxConnsPerHost:     *maxConnsPerHost,
 		IdleConnTimeout:     90 * time.Second,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		DialContext: (&net.Dialer{
@@ -461,7 +575,9 @@ func main() {
 	fmt.Printf("EWMA Alpha : %.2f\n", *ewmaAlpha)
 	fmt.Printf("Health     : every %s\n", *healthInterval)
 	fmt.Printf("Timeout    : %s\n", *backendTimeout)
-	fmt.Printf("Err Cooldn : %s\n\n", *errorCooldown)
+	fmt.Printf("Err Cooldn : %s\n", *errorCooldown)
+	fmt.Printf("Max Conns/Host      : %d\n", *maxConnsPerHost)
+	fmt.Printf("Max Idle Conns/Host : %d\n\n", *maxIdleConnsPerHost)
 	fmt.Printf("  /lb/health   — LB liveness\n")
 	fmt.Printf("  /lb/status   — backend states\n")
 	fmt.Printf("  /lb/metrics  — counters + latency\n")
