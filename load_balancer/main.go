@@ -26,11 +26,35 @@ type Backend struct {
 	URL        *url.URL
 	Alive      atomic.Bool
 	InFlight   atomic.Int64
-	Overloaded atomic.Bool            // true when EWMA > thresholdMs
+	Overloaded atomic.Bool            // true when EWMA (real request latency only) > thresholdMs
 	proxy      *httputil.ReverseProxy // created once at startup; reused for every request
 
 	ewmaMu sync.Mutex
-	ewmaMs float64 // exponential weighted moving average latency in ms
+	ewmaMs float64 // exponential weighted moving average latency in ms — driven ONLY by real completed requests
+
+	// errorCooldownUntil holds a UnixNano deadline. While now < deadline, the backend
+	// is treated as overloaded because of a recent error/timeout — kept entirely
+	// separate from ewmaMs so a single slow/failed request can't poison the latency
+	// signal used for real request routing (see isOverloaded/tripErrorCooldown).
+	errorCooldownUntil atomic.Int64
+}
+
+// tripErrorCooldown marks the backend as overloaded for a fixed, deterministic
+// window following an error/timeout. Unlike the EWMA, this decays purely by wall
+// clock — it doesn't require the backend to go idle and doesn't compound with
+// real traffic latency, so one bad response can't cause a runaway spiral.
+func (b *Backend) tripErrorCooldown(d time.Duration) {
+	b.errorCooldownUntil.Store(time.Now().Add(d).UnixNano())
+}
+
+// isOverloaded is the single source of truth bestBackend() and reporting should use:
+// true if either real-traffic EWMA is over threshold, OR we're still inside the
+// post-error cooldown window.
+func (b *Backend) isOverloaded() bool {
+	if time.Now().UnixNano() < b.errorCooldownUntil.Load() {
+		return true
+	}
+	return b.Overloaded.Load()
 }
 
 func (b *Backend) recordLatency(d time.Duration, alpha, thresholdMs float64) {
@@ -121,11 +145,12 @@ func (m *Metrics) snapshotLatencies() []time.Duration {
 // ─── LoadBalancer ─────────────────────────────────────────────────────────────
 
 type LoadBalancer struct {
-	backends    []*Backend
-	metrics     Metrics
-	timeout     time.Duration
-	thresholdMs float64
-	ewmaAlpha   float64
+	backends      []*Backend
+	metrics       Metrics
+	timeout       time.Duration
+	thresholdMs   float64
+	ewmaAlpha     float64
+	errorCooldown time.Duration // how long a backend is treated as overloaded after an error/timeout
 }
 
 func (lb *LoadBalancer) bestBackend() *Backend {
@@ -134,7 +159,7 @@ func (lb *LoadBalancer) bestBackend() *Backend {
 
 	// Pass 1: prefer non-overloaded, alive backends (or idle overloaded ones to prevent starvation)
 	for _, b := range lb.backends {
-		if !b.Alive.Load() || (b.Overloaded.Load() && b.InFlight.Load() > 0) {
+		if !b.Alive.Load() || (b.isOverloaded() && b.InFlight.Load() > 0) {
 			continue
 		}
 		if s := b.score(); s < bestScore {
@@ -210,20 +235,24 @@ func (lb *LoadBalancer) healthHandler(w http.ResponseWriter, r *http.Request) {
 // statusHandler: GET /lb/status
 func (lb *LoadBalancer) statusHandler(w http.ResponseWriter, r *http.Request) {
 	type entry struct {
-		URL        string  `json:"url"`
-		Alive      bool    `json:"alive"`
-		InFlight   int64   `json:"in_flight"`
-		Overloaded bool    `json:"overloaded"`
-		EWMAMs     float64 `json:"ewma_ms"`
+		URL            string  `json:"url"`
+		Alive          bool    `json:"alive"`
+		InFlight       int64   `json:"in_flight"`
+		Overloaded     bool    `json:"overloaded"`      // combined: EWMA-over-threshold OR in error cooldown
+		EWMAOverloaded bool    `json:"ewma_overloaded"` // real-traffic latency signal only
+		ErrorCooldown  bool    `json:"error_cooldown"`  // true if still inside post-error cooldown window
+		EWMAMs         float64 `json:"ewma_ms"`
 	}
 	var list []entry
 	for _, b := range lb.backends {
 		list = append(list, entry{
-			URL:        b.URL.String(),
-			Alive:      b.Alive.Load(),
-			InFlight:   b.InFlight.Load(),
-			Overloaded: b.Overloaded.Load(),
-			EWMAMs:     b.getEWMA(),
+			URL:            b.URL.String(),
+			Alive:          b.Alive.Load(),
+			InFlight:       b.InFlight.Load(),
+			Overloaded:     b.isOverloaded(),
+			EWMAOverloaded: b.Overloaded.Load(),
+			ErrorCooldown:  time.Now().UnixNano() < b.errorCooldownUntil.Load(),
+			EWMAMs:         b.getEWMA(),
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -238,7 +267,7 @@ func (lb *LoadBalancer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 	overloadedCount := 0
 	for _, b := range lb.backends {
-		if b.Overloaded.Load() {
+		if b.isOverloaded() {
 			overloadedCount++
 		}
 	}
@@ -321,6 +350,9 @@ func main() {
 	ewmaAlpha := flag.Float64("ewma-alpha", 0.2,
 		"smoothing factor: higher = faster reaction")
 
+	errorCooldown := flag.Duration("error-cooldown", 3*time.Second,
+		"how long a backend is treated as overloaded after an error/timeout, independent of latency EWMA")
+
 	flag.Parse()
 
 	// Build backend list with pre-created connection-pooling proxies
@@ -350,9 +382,10 @@ func main() {
 	}
 
 	lb := &LoadBalancer{
-		timeout:     *backendTimeout,
-		thresholdMs: *thresholdMs,
-		ewmaAlpha:   *ewmaAlpha,
+		timeout:       *backendTimeout,
+		thresholdMs:   *thresholdMs,
+		ewmaAlpha:     *ewmaAlpha,
+		errorCooldown: *errorCooldown,
 	}
 	for _, raw := range strings.Split(*backendsFlag, ",") {
 		raw = strings.TrimSpace(raw)
@@ -382,8 +415,18 @@ func main() {
 			if !isTimeout {
 				b.Alive.Store(false)
 			}
-			b.Overloaded.Store(true)
-			b.recordLatency(lb.timeout, lb.ewmaAlpha, lb.thresholdMs)
+			// IMPORTANT: do NOT call b.recordLatency(lb.timeout, ...) here. Feeding the
+			// full configured timeout into the real-request EWMA as a fake "sample"
+			// used to cause a single error to spike the average toward lb.timeout,
+			// which (a) could only be brought back down by decayIdle() during health
+			// checks, which only runs when InFlight==0 — impossible on a backend under
+			// sustained load — and (b) once Overloaded flipped true, bestBackend()
+			// routed all new traffic to the remaining backends, overloading them too.
+			// One slow/failed request could cascade into taking every backend out of
+			// rotation. tripErrorCooldown gives the same "back off this backend"
+			// behavior but decays deterministically by wall-clock time, independent of
+			// traffic, and never touches the EWMA that real request routing relies on.
+			b.tripErrorCooldown(lb.errorCooldown)
 			lb.metrics.BackendErrors.Add(1)
 			lb.metrics.Failed.Add(1)
 			if isTimeout {
@@ -417,7 +460,8 @@ func main() {
 	fmt.Printf("Threshold  : %.1f ms\n", *thresholdMs)
 	fmt.Printf("EWMA Alpha : %.2f\n", *ewmaAlpha)
 	fmt.Printf("Health     : every %s\n", *healthInterval)
-	fmt.Printf("Timeout    : %s\n\n", *backendTimeout)
+	fmt.Printf("Timeout    : %s\n", *backendTimeout)
+	fmt.Printf("Err Cooldn : %s\n\n", *errorCooldown)
 	fmt.Printf("  /lb/health   — LB liveness\n")
 	fmt.Printf("  /lb/status   — backend states\n")
 	fmt.Printf("  /lb/metrics  — counters + latency\n")
