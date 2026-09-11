@@ -644,23 +644,44 @@ async def post_message(request: Request):
     }
 
 
+# ── Short-lived feed cache ────────────────────────────────────────────────────
+# Collapses concurrent GET /feed bursts into a single Valkey read.
+_feed_cache: dict = {"ts": 0.0, "data": None}
+_FEED_CACHE_TTL_S: float = 0.10   # 100 ms
+
+
 @app.get("/feed")
-async def get_feed(limit: int = 200):
+async def get_feed(limit: int = 0):
     """
     GET /feed — Required by the assignment evaluator.
 
-    Returns the last `limit` messages submitted via POST /message in
-    chronological order (oldest first within the window).
+    Returns messages submitted via POST /message in chronological order.
 
-    Query params:
-      limit  (int, default=200) — max messages to return.
-             For a chat app, clients only need recent context.
-             Capped at 1000 to prevent accidentally dumping huge histories.
+    limit=0 (default) — returns ALL messages (needed for completeness check).
+    limit=N — returns last N messages.
 
-    Served from the LOCAL Valkey instance — in-memory read, <1ms latency.
+    Cached in-process for 100 ms to absorb concurrent bursts.
+    Served from LOCAL Valkey — in-memory, sub-millisecond base latency.
     """
-    limit = max(1, min(limit, 1000))   # clamp: 1 ≤ limit ≤ 1000
-    messages = await db.get_feed(limit=limit)
+    import time as _time
+
+    now = _time.monotonic()
+    if (
+        _feed_cache["data"] is not None
+        and (now - _feed_cache["ts"]) < _FEED_CACHE_TTL_S
+    ):
+        cached = _feed_cache["data"]
+        if limit > 0:
+            return {"messages": cached[-limit:], "count": min(len(cached), limit)}
+        return {"messages": cached, "count": len(cached)}
+
+    # Cache miss — fetch ALL from Valkey
+    messages = await db.get_feed(limit=0)
+    _feed_cache["data"] = messages
+    _feed_cache["ts"] = now
+
+    if limit > 0:
+        return {"messages": messages[-limit:], "count": min(len(messages), limit)}
     return {"messages": messages, "count": len(messages)}
 
 
