@@ -43,10 +43,32 @@ _primary_url = os.environ.get(
 _replica_url = os.environ.get("VALKEY_REPLICA_URL", _primary_url)
 
 # Write client — connected to primary.
-_rw = redis.from_url(_primary_url, decode_responses=False)
+# socket_timeout / socket_connect_timeout: without these, redis-py blocks
+# INDEFINITELY on a stalled connection (dropped packet, momentarily
+# unreachable replica, etc). Since db calls run inside asyncio.to_thread(),
+# an indefinite block eats a threadpool slot permanently — enough of those
+# under sustained load exhausts the pool and the whole process stops
+# answering requests, including plain health checks, and never recovers
+# even after traffic stops. A bounded timeout turns that into a fast,
+# recoverable error instead.
+_rw = redis.from_url(
+    _primary_url,
+    decode_responses=False,
+    socket_timeout=2,
+    socket_connect_timeout=2,
+    health_check_interval=30,
+    retry_on_timeout=True,
+)
 
 # Read client — connected to local replica.
-_ro = redis.from_url(_replica_url, decode_responses=False)
+_ro = redis.from_url(
+    _replica_url,
+    decode_responses=False,
+    socket_timeout=2,
+    socket_connect_timeout=2,
+    health_check_interval=30,
+    retry_on_timeout=True,
+)
 
 # HMAC_SECRET loaded from environment (set in .env, never hardcoded)
 def _get_hmac_secret() -> bytes:
