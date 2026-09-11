@@ -1,104 +1,237 @@
-import paramiko
-import time
+"""Deploy the messaging backends, Go load balancer, and frontend to the lab VMs."""
+
+from __future__ import annotations
+
+import argparse
 import os
-import sys
+import posixpath
+import shlex
+import time
+from pathlib import Path
 
-PASSWORD = "12342090"
-HOST = "10.1.75.53"
+import paramiko
 
-def ssh_exec(port, command, sudo=False):
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+from lab_config import (
+    BACKEND_URLS,
+    LAB_HOST,
+    SYS1_SSH_PORT,
+    SYS1_LB_PUBLIC_PORT,
+    SYS2_SSH_PORT,
+    SYS3_SSH_PORT,
+    SYS4_SSH_PORT,
+    connect_ssh,
+    ssh_password,
+)
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+REMOTE_ROOT = "group-chat-app"
+BACKEND_PORT = int(os.environ.get("PORT", "5000"))
+LB_PORT = int(os.environ.get("LB_PORT", "4000"))
+PUBLIC_LB_PORT = int(os.environ.get("PUBLIC_LB_PORT", str(SYS1_LB_PUBLIC_PORT)))
+FRONTEND_PORT = int(os.environ.get("FRONTEND_PORT", "3000"))
+PIP_FLAGS = os.environ.get("LAB_PIP_FLAGS", "--break-system-packages")
+
+
+def ssh_exec(
+    client: paramiko.SSHClient,
+    command: str,
+    *,
+    sudo: bool = False,
+    timeout: int = 180,
+) -> str:
+    printable = f"sudo {command}" if sudo else command
+    print(f"  > {printable}")
+    actual = command
+    if sudo:
+        actual = f"sudo -S -p '' sh -c {shlex.quote(command)}"
+
+    stdin, stdout, stderr = client.exec_command(actual, timeout=timeout)
+    if sudo:
+        stdin.write(ssh_password() + "\n")
+        stdin.flush()
+
+    output = stdout.read().decode("utf-8", errors="replace")
+    error_output = stderr.read().decode("utf-8", errors="replace")
+    exit_status = stdout.channel.recv_exit_status()
+    if output.strip():
+        print(output.rstrip())
+    if error_output.strip():
+        print(error_output.rstrip())
+    if exit_status != 0:
+        raise RuntimeError(f"Remote command failed with exit status {exit_status}: {printable}")
+    return output
+
+
+def _ensure_remote_directory(sftp: paramiko.SFTPClient, remote_directory: str) -> None:
+    current = ""
+    for component in remote_directory.strip("/").split("/"):
+        current = posixpath.join(current, component)
+        try:
+            sftp.stat(current)
+        except OSError:
+            sftp.mkdir(current)
+
+
+def upload_file(
+    client: paramiko.SSHClient,
+    local_path: str | Path,
+    remote_path: str,
+) -> None:
+    source = PROJECT_ROOT / local_path
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    sftp = client.open_sftp()
     try:
-        client.connect(hostname=HOST, port=port, username="student", password=PASSWORD, timeout=10)
-        if sudo:
-            command = f"echo {PASSWORD} | sudo -S {command}"
-        print(f"[{HOST}:{port}] Executing: {command}")
-        stdin, stdout, stderr = client.exec_command(command)
-        exit_status = stdout.channel.recv_exit_status()
-        out = stdout.read().decode('utf-8', errors='replace').encode('ascii', 'ignore').decode('ascii')
-        err = stderr.read().decode('utf-8', errors='replace').encode('ascii', 'ignore').decode('ascii')
-        if out: print(f"[{HOST}:{port}] STDOUT:\n{out}")
-        if err: print(f"[{HOST}:{port}] STDERR:\n{err}")
-        return exit_status
+        _ensure_remote_directory(sftp, posixpath.dirname(remote_path))
+        print(f"  Uploading {source.relative_to(PROJECT_ROOT)} -> {remote_path}")
+        sftp.put(str(source), remote_path)
     finally:
-        client.close()
-
-def ssh_upload(port, local_path, remote_path):
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(hostname=HOST, port=port, username="student", password=PASSWORD, timeout=10)
-        sftp = client.open_sftp()
-        print(f"[{HOST}:{port}] Uploading {local_path} to {remote_path}")
-        
-        if os.path.isdir(local_path):
-            try:
-                sftp.mkdir(remote_path)
-            except IOError:
-                pass
-            for item in os.listdir(local_path):
-                lp = os.path.join(local_path, item)
-                rp = remote_path + "/" + item
-                if os.path.isfile(lp):
-                    sftp.put(lp, rp)
-        else:
-            sftp.put(local_path, remote_path)
         sftp.close()
+
+
+def upload_tree(
+    client: paramiko.SSHClient,
+    local_directory: str | Path,
+    remote_directory: str,
+) -> None:
+    source_root = PROJECT_ROOT / local_directory
+    if not source_root.is_dir():
+        raise FileNotFoundError(source_root)
+    sftp = client.open_sftp()
+    try:
+        _ensure_remote_directory(sftp, remote_directory)
+        for source in sorted(path for path in source_root.rglob("*") if path.is_file()):
+            if "__pycache__" in source.parts or source.suffix == ".pyc":
+                continue
+            relative = source.relative_to(source_root).as_posix()
+            destination = posixpath.join(remote_directory, relative)
+            _ensure_remote_directory(sftp, posixpath.dirname(destination))
+            print(f"  Uploading {source.relative_to(PROJECT_ROOT)} -> {destination}")
+            sftp.put(str(source), destination)
+    finally:
+        sftp.close()
+
+
+def setup_backend(ssh_port: int, system_name: str) -> None:
+    print(f"\n=== Deploying backend to {system_name} ({LAB_HOST}:{ssh_port}) ===")
+    client = connect_ssh(ssh_port)
+    try:
+        ssh_exec(client, f"mkdir -p {REMOTE_ROOT}/server")
+        for local, remote in (
+            ("server/server.py", f"{REMOTE_ROOT}/server/server.py"),
+            ("server/db.py", f"{REMOTE_ROOT}/server/db.py"),
+            ("server/requirements.txt", f"{REMOTE_ROOT}/server/requirements.txt"),
+            (".env", f"{REMOTE_ROOT}/.env"),
+            ("cert.pem", f"{REMOTE_ROOT}/cert.pem"),
+            ("key.pem", f"{REMOTE_ROOT}/key.pem"),
+        ):
+            upload_file(client, local, remote)
+
+        ssh_exec(
+            client,
+            f"python3 -m pip install {PIP_FLAGS} -r {REMOTE_ROOT}/server/requirements.txt",
+            timeout=300,
+        )
+        ssh_exec(client, f"fuser -k {BACKEND_PORT}/tcp || true")
+        ssh_exec(
+            client,
+            f"cd {REMOTE_ROOT} && rm -f server/chat.db* && python3 -c 'from server.db import init_db; init_db()' && PORT={BACKEND_PORT} "
+            "setsid -f python3 -m uvicorn server.server:app --host 0.0.0.0 --port $PORT --workers 4 --ssl-keyfile key.pem --ssl-certfile cert.pem > server.log 2>&1 < /dev/null",
+        )
+        time.sleep(3)
+        ssh_exec(
+            client,
+            f"curl -k --fail --silent --show-error https://127.0.0.1:{BACKEND_PORT}/health",
+        )
     finally:
         client.close()
 
-def setup_backend(port_ssh):
-    print(f"\n--- Setting up backend on SSH port {port_ssh} ---")
-    ssh_exec(port_ssh, "mkdir -p group-chat-app/server group-chat-app/client")
-    
-    ssh_upload(port_ssh, "server/server.py", "group-chat-app/server/server.py")
-    ssh_upload(port_ssh, "server/db.py", "group-chat-app/server/db.py")
-    ssh_upload(port_ssh, ".env", "group-chat-app/.env")
-    ssh_upload(port_ssh, "cert.pem", "group-chat-app/cert.pem")
-    ssh_upload(port_ssh, "key.pem", "group-chat-app/key.pem")
-    ssh_upload(port_ssh, "client", "group-chat-app/client")
-    
-    ssh_exec(port_ssh, "pip3 install --break-system-packages fastapi uvicorn websockets python-multipart bcrypt cryptography python-dotenv")
-    ssh_exec(port_ssh, "pkill -f server.py || true")
-    
-    # Run the server on port 5000
-    ssh_exec(port_ssh, "export PORT=5000; nohup python3 group-chat-app/server/server.py > group-chat-app/server.log 2>&1 &")
-    time.sleep(2)
-    ssh_exec(port_ssh, "curl -k -s https://localhost:5000/health || echo 'Server failed to start'")
 
-def setup_load_balancer(port_ssh):
-    print(f"\n--- Setting up Load Balancer on SSH port {port_ssh} ---")
-    ssh_exec(port_ssh, "apt update", sudo=True)
-    ssh_exec(port_ssh, "apt install -y golang-go", sudo=True)
-    
-    ssh_exec(port_ssh, "mkdir -p group-chat-app")
-    ssh_upload(port_ssh, "load_balancer.go", "group-chat-app/load_balancer.go")
-    ssh_upload(port_ssh, "cert.pem", "group-chat-app/cert.pem")
-    ssh_upload(port_ssh, "key.pem", "group-chat-app/key.pem")
-    
-    ssh_exec(port_ssh, "pkill -f load_balancer || true")
-    
-    # Build LB
-    ssh_exec(port_ssh, "cd group-chat-app && go build load_balancer.go")
-    
-    # Start LB in background
-    backends = "https://172.17.0.39:5000,https://172.17.0.40:5000,https://172.17.0.41:5000"
-    start_cmd = f"cd group-chat-app && nohup ./load_balancer -backends {backends} -port 8082 > lb.log 2>&1 &"
-    ssh_exec(port_ssh, start_cmd)
-    time.sleep(2)
-    ssh_exec(port_ssh, "curl -s http://localhost:8082/lb/health || echo 'LB failed to start'")
+def _upload_go_project(client: paramiko.SSHClient) -> None:
+    upload_file(client, "go.mod", f"{REMOTE_ROOT}/go.mod")
+    upload_tree(client, "cmd/load-balancer", f"{REMOTE_ROOT}/cmd/load-balancer")
+    upload_tree(client, "internal/loadbalancer", f"{REMOTE_ROOT}/internal/loadbalancer")
+
+
+def setup_load_balancer(ssh_port: int = SYS1_SSH_PORT) -> None:
+    if len(BACKEND_URLS) != 3:
+        raise ValueError("LAB_BACKEND_URLS must contain exactly three backend URLs")
+
+    print(f"\n=== Deploying load balancer and frontend to Sys1 ({LAB_HOST}:{ssh_port}) ===")
+    client = connect_ssh(ssh_port)
+    try:
+        ssh_exec(client, "apt-get update", sudo=True, timeout=300)
+        ssh_exec(client, "apt-get install -y golang-go python3-pip", sudo=True, timeout=300)
+        ssh_exec(client, f"mkdir -p {REMOTE_ROOT}")
+
+        _upload_go_project(client)
+        upload_file(client, "cert.pem", f"{REMOTE_ROOT}/cert.pem")
+        upload_file(client, "key.pem", f"{REMOTE_ROOT}/key.pem")
+        upload_tree(client, "client", f"{REMOTE_ROOT}/client")
+
+        ssh_exec(client, "pkill -f '[l]oad_balancer' || true")
+        ssh_exec(client, f"cd {REMOTE_ROOT} && go build -o load_balancer ./cmd/load-balancer")
+        backends = ",".join(BACKEND_URLS)
+        ssh_exec(
+            client,
+            f"cd {REMOTE_ROOT} && setsid -f ./load_balancer "
+            f"-backends {shlex.quote(backends)} -port {LB_PORT} "
+            "-backend-insecure-skip-verify "
+            "-load-threshold 50 -backend-timeout 30s "
+            "> lb.log 2>&1 < /dev/null",
+        )
+        time.sleep(3)
+        ssh_exec(
+            client,
+            f"curl --fail --silent --show-error http://127.0.0.1:{LB_PORT}/lb/health",
+        )
+
+        ssh_exec(
+            client,
+            f"python3 -m pip install {PIP_FLAGS} fastapi 'uvicorn[standard]' python-dotenv",
+            timeout=300,
+        )
+        ssh_exec(client, "pkill -f '[c]lient/serve.py' || true")
+        ssh_exec(
+            client,
+            f"cd {REMOTE_ROOT} && FRONTEND_PORT={FRONTEND_PORT} "
+            f"BACKEND_PORT={PUBLIC_LB_PORT} "
+            "setsid -f python3 client/serve.py > frontend.log 2>&1 < /dev/null",
+        )
+        time.sleep(3)
+        ssh_exec(
+            client,
+            f"curl -k --fail --silent --show-error https://127.0.0.1:{FRONTEND_PORT}/ >/dev/null",
+        )
+    finally:
+        client.close()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "target",
+        nargs="?",
+        choices=("all", "backends", "lb"),
+        default="all",
+        help="Deployment portion to run (default: all)",
+    )
+    args = parser.parse_args()
+
+    if args.target in {"all", "backends"}:
+        for port, name in (
+            (SYS2_SSH_PORT, "Sys2"),
+            (SYS3_SSH_PORT, "Sys3"),
+            (SYS4_SSH_PORT, "Sys4"),
+        ):
+            setup_backend(port, name)
+    if args.target in {"all", "lb"}:
+        setup_load_balancer()
+
+    print("\nDeployment completed and every started service passed its health check.")
+    return 0
+
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "backend":
-        setup_backend(2238) # sys2
-        setup_backend(2239) # sys3
-        setup_backend(2240) # sys4
-    elif len(sys.argv) > 1 and sys.argv[1] == "lb":
-        setup_load_balancer(2237) # sys1
-    else:
-        setup_backend(2238)
-        setup_backend(2239)
-        setup_backend(2240)
-        setup_load_balancer(2237)
-    print("\nDeployment completed successfully.")
+    raise SystemExit(main())

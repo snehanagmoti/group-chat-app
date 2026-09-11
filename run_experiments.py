@@ -1,104 +1,125 @@
-import paramiko
-import sys
+"""Run the fair one-vs-three-backend comparison on Sys1 and fetch results."""
+
+from __future__ import annotations
+
+import posixpath
+import shlex
 import time
+from pathlib import Path
 
-PASSWORD = "12342090"
-HOST = "10.1.75.53"
+from deploy_and_run import LB_PORT, PROJECT_ROOT, REMOTE_ROOT, ssh_exec, upload_file, upload_tree
+from lab_config import (
+    BACKEND_URLS,
+    SYS1_SSH_PORT,
+    SYS2_SSH_PORT,
+    SYS3_SSH_PORT,
+    SYS4_SSH_PORT,
+    connect_ssh,
+)
 
-def ssh_exec(client, command, timeout=120):
-    print(f"  > {command}")
-    stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-    exit_status = stdout.channel.recv_exit_status()
-    out = stdout.read().decode('utf-8', errors='replace')
-    err = stderr.read().decode('utf-8', errors='replace')
-    if out: print(out.strip())
-    if err and "WARNING" not in err and "password" not in err:
-        print(f"  STDERR: {err.strip()}")
-    return exit_status, out
 
-def check_backends():
-    """Verify all 3 backends are up and healthy."""
-    print("=" * 60)
-    print("STEP 1: Checking backend health")
-    print("=" * 60)
-    ports = [(2238, "sys2"), (2239, "sys3"), (2240, "sys4")]
-    all_ok = True
-    for port, name in ports:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname=HOST, port=port, username="student", password=PASSWORD, timeout=10)
-        status, out = ssh_exec(client, "curl -k -s https://localhost:5000/health")
-        if '"status":"ok"' in out:
-            print(f"  [OK] {name} (port {port}): HEALTHY")
-        else:
-            print(f"  [FAIL] {name} (port {port}): DOWN - restarting...")
-            ssh_exec(client, "pkill -f server.py || true")
-            time.sleep(1)
-            ssh_exec(client, "export PORT=5000; nohup python3 group-chat-app/server/server.py > group-chat-app/server.log 2>&1 &")
-            time.sleep(3)
-            status, out = ssh_exec(client, "curl -k -s https://localhost:5000/health")
-            if '"status":"ok"' in out:
-                print(f"  [OK] {name} (port {port}): RECOVERED")
-            else:
-                print(f"  [FAIL] {name} (port {port}): STILL DOWN")
-                all_ok = False
+def restore_three_backend_load_balancer(client) -> None:
+    """Leave Sys1 serving the normal three-backend topology after measurement."""
+    backends = ",".join(BACKEND_URLS)
+    ssh_exec(client, "pkill -f '[l]oad_balancer' || true")
+    ssh_exec(
+        client,
+        f"cd {REMOTE_ROOT} && setsid -f ./load_balancer "
+        f"-backends {shlex.quote(backends)} -port {LB_PORT} "
+        "-backend-insecure-skip-verify -tls-cert cert.pem -tls-key key.pem "
+        "> lb.log 2>&1 < /dev/null",
+    )
+    time.sleep(2)
+    ssh_exec(
+        client,
+        f"curl -k --fail --silent --show-error https://127.0.0.1:{LB_PORT}/lb/health",
+    )
+
+
+def check_backends() -> bool:
+    print("=== Checking backend health ===")
+    all_healthy = True
+    for port, name in (
+        (SYS2_SSH_PORT, "Sys2"),
+        (SYS3_SSH_PORT, "Sys3"),
+        (SYS4_SSH_PORT, "Sys4"),
+    ):
+        client = connect_ssh(port)
+        try:
+            try:
+                output = ssh_exec(
+                    client,
+                    "curl -k --fail --silent --show-error https://127.0.0.1:5000/health",
+                )
+                healthy = '"status":"ok"' in output.replace(" ", "")
+            except RuntimeError:
+                healthy = False
+            print(f"  {name}: {'healthy' if healthy else 'DOWN'}")
+            all_healthy = all_healthy and healthy
+        finally:
+            client.close()
+    return all_healthy
+
+
+def upload_experiment_sources(client) -> None:
+    upload_file(client, "go.mod", f"{REMOTE_ROOT}/go.mod")
+    upload_file(client, "run_experiments.sh", f"{REMOTE_ROOT}/run_experiments.sh")
+    upload_file(client, "cert.pem", f"{REMOTE_ROOT}/cert.pem")
+    upload_file(client, "key.pem", f"{REMOTE_ROOT}/key.pem")
+    upload_tree(client, "cmd/load-balancer", f"{REMOTE_ROOT}/cmd/load-balancer")
+    upload_tree(client, "cmd/load-generator", f"{REMOTE_ROOT}/cmd/load-generator")
+    upload_tree(client, "internal/loadbalancer", f"{REMOTE_ROOT}/internal/loadbalancer")
+    upload_tree(client, "internal/loadgenerator", f"{REMOTE_ROOT}/internal/loadgenerator")
+
+
+def download_results(client) -> None:
+    sftp = client.open_sftp()
+    try:
+        for filename in (
+            "results.csv",
+            "1_backend.json",
+            "3_backends.json",
+            "1_backend_lb_status.json",
+            "1_backend_lb_metrics.json",
+            "3_backends_lb_status.json",
+            "3_backends_lb_metrics.json",
+            "lb.log",
+        ):
+            remote = posixpath.join(REMOTE_ROOT, filename)
+            local = PROJECT_ROOT / filename
+            sftp.get(remote, str(local))
+            print(f"  Downloaded {filename}")
+    finally:
+        sftp.close()
+
+
+def main() -> int:
+    if not check_backends():
+        print("At least one backend is unhealthy. Deploy or repair the backends before comparing them.")
+        return 1
+
+    print("\n=== Uploading experiment sources to Sys1 ===")
+    client = connect_ssh(SYS1_SSH_PORT)
+    try:
+        upload_experiment_sources(client)
+        ssh_exec(client, f"chmod +x {REMOTE_ROOT}/run_experiments.sh")
+        ssh_exec(client, "pkill -f '[l]oad_balancer' || true")
+
+        print("\n=== Running experiments on Sys1 ===")
+        started = time.monotonic()
+        ssh_exec(client, f"cd {REMOTE_ROOT} && ./run_experiments.sh", timeout=600)
+        print(f"Experiments completed in {time.monotonic() - started:.1f}s")
+
+        print("\n=== Downloading results ===")
+        download_results(client)
+    finally:
+        print("\n=== Restoring the three-backend load balancer ===")
+        restore_three_backend_load_balancer(client)
         client.close()
-    return all_ok
 
-def upload_and_run_experiments():
-    """Upload updated files and run experiments on sys1."""
-    print()
-    print("=" * 60)
-    print("STEP 2: Uploading updated files to sys1")
-    print("=" * 60)
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(hostname=HOST, port=2237, username="student", password=PASSWORD, timeout=10)
+    print("Experiment artifacts are synchronized to the project folder.")
+    return 0
 
-    sftp = client.open_sftp()
-    for local, remote in [
-        ("load_balancer.go", "group-chat-app/load_balancer.go"),
-        ("load_generator.go", "group-chat-app/load_generator.go"),
-        ("run_experiments.sh", "group-chat-app/run_experiments.sh"),
-    ]:
-        print(f"  Uploading {local}...")
-        sftp.put(local, remote)
-    sftp.close()
-
-    ssh_exec(client, "chmod +x group-chat-app/run_experiments.sh")
-
-    print()
-    print("=" * 60)
-    print("STEP 3: Running experiments on sys1")
-    print("=" * 60)
-    status, out = ssh_exec(client, "cd group-chat-app && bash ./run_experiments.sh", timeout=300)
-
-    print()
-    print("=" * 60)
-    print("STEP 4: Downloading results")
-    print("=" * 60)
-    sftp = client.open_sftp()
-    try:
-        sftp.get("group-chat-app/results.csv", "results.csv")
-        print("  [OK] Downloaded results.csv")
-    except Exception as e:
-        print(f"  [FAIL] Failed to download results.csv: {e}")
-    try:
-        sftp.get("group-chat-app/1_backend.json", "1_backend.json")
-        print("  [OK] Downloaded 1_backend.json")
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-    try:
-        sftp.get("group-chat-app/3_backends.json", "3_backends.json")
-        print("  [OK] Downloaded 3_backends.json")
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-    sftp.close()
-    client.close()
 
 if __name__ == "__main__":
-    backends_ok = check_backends()
-    if not backends_ok:
-        print("\nWARNING: Some backends are down. Proceeding anyway...")
-    upload_and_run_experiments()
-    print("\n[OK] ALL DONE")
+    raise SystemExit(main())

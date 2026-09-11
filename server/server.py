@@ -954,6 +954,40 @@ async def websocket_endpoint(websocket: WebSocket):
                     "type":  "userList",
                     "users": manager.get_room_users(room_id),
                 })
+# ── Lab 6 Load Gen Endpoints ─────────────────────────────────────────────────
+
+@app.post("/message")
+async def loadgen_message(req: Request):
+    data = await req.json()
+    client_name = data.get("client-name", "unknown")
+    msg = data.get("msg", "")
+    # Use deterministic msg_id so all backends store the same ID
+    import hashlib
+    msg_id = hashlib.md5(f"{client_name}:{msg}:{data.get('ts', '')}".encode()).hexdigest()
+    db.save_message_fast(
+        room_id="default",
+        msg_id=msg_id,
+        username=client_name,
+        msg=msg,
+        timestamp=timestamp(),
+    )
+    return {"status": "ok", "msg_id": msg_id}
+
+@app.get("/feed")
+async def loadgen_feed():
+    history = db.get_history_fast(room_id="default")
+    return {"messages": history}
+
+@app.post("/clear")
+async def clear_messages():
+    """Clear load-gen messages from DB to start fresh."""
+    conn = db._get_conn()
+    try:
+        conn.execute("DELETE FROM messages WHERE room_id = 'default'")
+        conn.commit()
+    finally:
+        db._put_conn(conn)
+    return {"status": "cleared"}
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

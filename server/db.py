@@ -109,6 +109,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE messages ADD COLUMN attachment TEXT DEFAULT NULL")
         print("[DB] Migration: added attachment column to messages")
 
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_id ON messages(msg_id) WHERE msg_id != ''")
+    print("[DB] Migration: ensured unique index on msg_id")
+
     cursor = conn.execute("PRAGMA table_info(users)")
     columns = {row[1] for row in cursor.fetchall()}
     if "xp" not in columns:
@@ -122,6 +125,44 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         print("[DB] Migration: added avatar column to rooms")
 
 
+# ── Persistent connection pool ────────────────────────────────────────────────
+
+import threading
+
+_pool_lock = threading.Lock()
+_pool: list[sqlite3.Connection] = []
+_POOL_SIZE = 8
+
+
+def _configure_conn(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """Apply performance pragmas to a connection."""
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-64000")   # 64 MB
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    return conn
+
+
+def _get_conn() -> sqlite3.Connection:
+    """Get a connection from the pool, or create a new one."""
+    with _pool_lock:
+        if _pool:
+            return _pool.pop()
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    return _configure_conn(conn)
+
+
+def _put_conn(conn: sqlite3.Connection) -> None:
+    """Return a connection to the pool."""
+    with _pool_lock:
+        if len(_pool) < _POOL_SIZE:
+            _pool.append(conn)
+        else:
+            conn.close()
+
+
 # ── Initialisation ────────────────────────────────────────────────────────────
 
 def init_db() -> None:
@@ -129,7 +170,17 @@ def init_db() -> None:
     with _connect() as conn:
         conn.executescript(_SCHEMA)
         _apply_migrations(conn)
-    print(f"[DB] Initialised — {DB_PATH}")
+        # Enable WAL mode at init
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=-64000")
+        conn.execute("PRAGMA busy_timeout=5000")
+    # Pre-fill the pool
+    for _ in range(_POOL_SIZE):
+        c = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        _configure_conn(c)
+        _pool.append(c)
+    print(f"[DB] Initialised (WAL mode, pool={_POOL_SIZE}) — {DB_PATH}")
 
 
 def _connect() -> sqlite3.Connection:
@@ -250,7 +301,7 @@ def save_message(
     """
     Persist an encrypted, signed message to the DB.
     Computes and stores HMAC for future tamper detection.
-    Returns the new row id.
+    Returns the new row id, or 0 if a duplicate msg_id was ignored.
     """
     hmac_digest = _compute_hmac(ciphertext, iv)
     pub_key_json = json.dumps(public_key)
@@ -258,32 +309,36 @@ def save_message(
     created_at_ts = time.time()
 
     with _connect() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO messages
-                (room_id, msg_id, username, avatar, ciphertext, iv, signature, public_key,
-                 timestamp, hmac_digest, sig_valid, reply_to, target_user, is_edited, created_at_ts, attachment)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-            """,
-            (
-                room_id,
-                msg_id,
-                username,
-                avatar,
-                ciphertext,
-                iv,
-                signature,
-                pub_key_json,
-                timestamp,
-                hmac_digest,
-                1 if sig_valid else 0,
-                reply_to,
-                target_user,
-                created_at_ts,
-                attachment,
-            ),
-        )
-        return cur.lastrowid
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO messages
+                    (room_id, msg_id, username, avatar, ciphertext, iv, signature, public_key,
+                     timestamp, hmac_digest, sig_valid, reply_to, target_user, is_edited, created_at_ts, attachment)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                """,
+                (
+                    room_id,
+                    msg_id,
+                    username,
+                    avatar,
+                    ciphertext,
+                    iv,
+                    signature,
+                    pub_key_json,
+                    timestamp,
+                    hmac_digest,
+                    1 if sig_valid else 0,
+                    reply_to,
+                    target_user,
+                    created_at_ts,
+                    attachment,
+                ),
+            )
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            print(f"[DB] Ignored duplicate message insertion for msg_id: {msg_id}")
+            return 0
 
 
 def get_history(room_id: str, limit: int | None = None, username: str | None = None) -> list[dict]:
@@ -340,6 +395,51 @@ def get_history(room_id: str, limit: int | None = None, username: str | None = N
             }
         )
     return messages
+
+
+def get_history_fast(room_id: str) -> list[dict]:
+    """
+    Lightweight history retrieval for load-gen /feed endpoint.
+    Skips HMAC verification and whisper filtering for maximum throughput.
+    """
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT msg_id, username, ciphertext, timestamp FROM messages WHERE room_id = ? ORDER BY id DESC",
+            (room_id,),
+        ).fetchall()
+    finally:
+        _put_conn(conn)
+
+    return [
+        {
+            "msg_id": row["msg_id"],
+            "username": row["username"],
+            "ciphertext": row["ciphertext"],
+            "timestamp": row["timestamp"],
+        }
+        for row in rows
+    ]
+
+
+def save_message_fast(room_id: str, msg_id: str, username: str, msg: str, timestamp: str) -> int:
+    """
+    Lightweight message save for load-gen /message endpoint.
+    Skips HMAC computation, signature storage, and attachment handling.
+    Returns row id or 0 if duplicate.
+    """
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            "INSERT INTO messages (room_id, msg_id, username, avatar, ciphertext, iv, signature, public_key, timestamp, hmac_digest, sig_valid) VALUES (?, ?, ?, 'wizard', ?, 'x', 'x', '{}', ?, 'x', 1)",
+            (room_id, msg_id, username, msg, timestamp),
+        )
+        conn.commit()
+        return cur.lastrowid
+    except sqlite3.IntegrityError:
+        return 0
+    finally:
+        _put_conn(conn)
 
 
 def get_message_by_id(msg_id: str) -> dict | None:

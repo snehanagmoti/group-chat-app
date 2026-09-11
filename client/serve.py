@@ -1,7 +1,7 @@
 """
 Frontend Static File Server
 ============================
-Serves the client/ directory on FRONTEND_PORT (default 5000).
+Serves the client/ directory on FRONTEND_PORT (default 3000).
 Run from the project root:  python client/serve.py
 """
 
@@ -13,7 +13,8 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
-FRONTEND_PORT = int(os.environ.get("FRONTEND_PORT", 5000))
+FRONTEND_PORT = int(os.environ.get("FRONTEND_PORT", 3000))
+FRONTEND_TLS = os.environ.get("FRONTEND_TLS", "1") != "0"
 CLIENT_DIR = Path(__file__).resolve().parent
 
 if __name__ == "__main__":
@@ -30,7 +31,8 @@ if __name__ == "__main__":
         from fastapi.responses import Response
         return Response(
             content=f"window.BACKEND_PORT = {backend_port};",
-            media_type="application/javascript"
+            media_type="application/javascript",
+            headers={"Cache-Control": "no-store"},
         )
 
     @app.get("/")
@@ -42,13 +44,18 @@ if __name__ == "__main__":
 
     print("=" * 50)
     print("  Frontend Server")
-    print(f"  URL: https://localhost:{FRONTEND_PORT}")
+    scheme = "https" if FRONTEND_TLS else "http"
+    print(f"  URL: {scheme}://localhost:{FRONTEND_PORT}")
     print("=" * 50)
     BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=FRONTEND_PORT,
-        ssl_keyfile=os.path.join(BASE_DIR, "key.pem"),
-        ssl_certfile=os.path.join(BASE_DIR, "cert.pem")
-    )
+    uvicorn_options = {
+        "app": app,
+        "host": "0.0.0.0",
+        "port": FRONTEND_PORT,
+    }
+    if FRONTEND_TLS:
+        uvicorn_options.update(
+            ssl_keyfile=os.path.join(BASE_DIR, "key.pem"),
+            ssl_certfile=os.path.join(BASE_DIR, "cert.pem"),
+        )
+    uvicorn.run(**uvicorn_options)

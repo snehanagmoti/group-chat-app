@@ -1,25 +1,23 @@
-import paramiko
-import sys
+from lab_config import (
+    SYS1_SSH_PORT,
+    SYS2_SSH_PORT,
+    SYS3_SSH_PORT,
+    SYS4_SSH_PORT,
+    connect_ssh,
+)
 
-def test_ssh(host, port, user, password):
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+def check_ssh(port):
     try:
-        print(f"Connecting to {host}:{port}...")
-        client.connect(hostname=host, port=port, username=user, password=password, timeout=10)
+        print(f"Connecting to SSH port {port}...")
+        client = connect_ssh(port)
         stdin, stdout, stderr = client.exec_command("go version")
-        print(f"[{host}:{port}] go version:", stdout.read().decode().strip())
+        print(f"[port {port}] go version:", stdout.read().decode().strip())
     except Exception as e:
-        print(f"[{host}:{port}] Failed to connect: {e}")
+        print(f"[port {port}] Failed to connect: {e}")
     finally:
-        client.close()
+        if "client" in locals():
+            client.close()
 
 if __name__ == "__main__":
-    systems = [
-        ("10.1.75.53", 2237),
-        ("10.1.75.53", 2238),
-        ("10.1.75.53", 2239),
-        ("10.1.75.53", 2240),
-    ]
-    for host, port in systems:
-        test_ssh(host, port, "student", "12342090")
+    for port in (SYS1_SSH_PORT, SYS2_SSH_PORT, SYS3_SSH_PORT, SYS4_SSH_PORT):
+        check_ssh(port)

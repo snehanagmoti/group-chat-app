@@ -17,6 +17,25 @@ venv.bak/
 .idea/
 .vscode/
 *.swp
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
 *.swo
 
 # OS generated files
@@ -25,7 +44,11 @@ Thumbs.db
 
 # Server uploads & database
 server/uploads/
-server/chat.db
+server/chat.db*
 
 # SSL Certificates
 *.pem
+
+# Local verification/build output
+tmp/
+*.exe

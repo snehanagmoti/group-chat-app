@@ -19,6 +19,13 @@ const SERVER_URL    = `${WS_PROTOCOL}//${BACKEND_HOST}/ws`;
 const UPLOAD_URL    = `${HTTP_PROTOCOL}//${BACKEND_HOST}/upload`;
 const GROUP_KEY_URL = `${HTTP_PROTOCOL}//${BACKEND_HOST}/group-key`;
 
+// The frontend and load balancer normally use different ports. Include
+// credentials so the browser stores/sends the load balancer's affinity cookie
+// across those same-site, cross-origin requests.
+function backendFetch(resource, options = {}) {
+    return fetch(resource, { ...options, credentials: "include" });
+}
+
 
 // ── Sounds ────────────────────────────────────────────────────────────────────
 const SOUNDS = {
@@ -253,7 +260,7 @@ function b64ToBuf(b64) {
 async function initCrypto() {
     try {
         // 1. Fetch key from server
-        const resp = await fetch(GROUP_KEY_URL);
+        const resp = await backendFetch(GROUP_KEY_URL);
         if (!resp.ok) throw new Error(`/group-key returned ${resp.status}`);
         const { key: keyHex } = await resp.json();
         if (!keyHex || keyHex.length !== 64) throw new Error("Invalid AES key length from server");
@@ -493,7 +500,7 @@ function connect() {
     ws.onopen = () => {
         reconnectAttempts = 0;
         updateConnectionStatus("connected");
-        // Send join with one-time token, ECDSA public key, and room_id
+        // Send the authenticated session token, ECDSA public key, and room_id
         ws.send(JSON.stringify({
             type:       "join",
             token:      sessionToken,
@@ -1578,7 +1585,7 @@ async function authenticate(mode) {
     btnText.textContent = "AUTHENTICATING...";
 
     try {
-        const res = await fetch(`${HTTP_PROTOCOL}//${BACKEND_HOST}${endpoint}`, {
+        const res = await backendFetch(`${HTTP_PROTOCOL}//${BACKEND_HOST}${endpoint}`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload)
@@ -1658,7 +1665,7 @@ if (attachmentToggleBtn && fileInput) {
         try {
             const formData = new FormData();
             formData.append("file", pendingFile);
-            const res = await fetch(UPLOAD_URL, { method: "POST", body: formData });
+            const res = await backendFetch(UPLOAD_URL, { method: "POST", body: formData });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             attachmentData = await res.json();
             if (attachmentData.url && attachmentData.url.startsWith("/")) {
@@ -2057,6 +2064,8 @@ function showLobbyScreen() {
         const pct = rank.level === 6 ? 100 : Math.min(100, (xpInLevel / xpNeeded) * 100);
         lobbyXpBar.style.width = `${pct.toFixed(1)}%`;
     }
+    if (lobbyError) lobbyError.textContent = "";
+    if (joinCodeError) joinCodeError.textContent = "";
     resetLobbyButtons();
     loadRooms();
     if (roomPollTimer) clearInterval(roomPollTimer);
@@ -2099,7 +2108,7 @@ window.setVisibility = setVisibility;
 
 async function loadRooms() {
     try {
-        const res = await fetch(`${HTTP_PROTOCOL}//${BACKEND_HOST}/rooms`);
+        const res = await backendFetch(`${HTTP_PROTOCOL}//${BACKEND_HOST}/rooms`);
         if (!res.ok) return;
         const data = await res.json();
         roomListCache = data.rooms || [];
@@ -2164,7 +2173,7 @@ async function createRoomAction() {
     createRoomBtn.disabled = true;
     createRoomBtnText.textContent = "CREATING...";
     try {
-        const res = await fetch(`${HTTP_PROTOCOL}//${BACKEND_HOST}/rooms`, {
+        const res = await backendFetch(`${HTTP_PROTOCOL}//${BACKEND_HOST}/rooms`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ name, is_public: isPublicRoom, avatar: selectedRoomAvatar, created_by: currentUsername }),
@@ -2197,7 +2206,7 @@ async function joinRoomByCode() {
     joinCodeBtn.disabled = true;
     joinCodeBtnText.textContent = "CHECKING...";
     try {
-        const res = await fetch(`${HTTP_PROTOCOL}//${BACKEND_HOST}/rooms/${code}`);
+        const res = await backendFetch(`${HTTP_PROTOCOL}//${BACKEND_HOST}/rooms/${code}`);
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "Room not found");
         await joinRoom(data.id, data.name);
@@ -2212,12 +2221,12 @@ async function joinRoom(roomId, roomName) {
     if (roomPollTimer) { clearInterval(roomPollTimer); roomPollTimer = null; }
     currentRoomId   = roomId;
     currentRoomName = roomName;
-    // Always refresh the one-time session token before joining via WebSocket
+    // Rotate the authenticated session token before joining via WebSocket
     try {
-        const res = await fetch(`${HTTP_PROTOCOL}//${BACKEND_HOST}/refresh-token`, {
+        const res = await backendFetch(`${HTTP_PROTOCOL}//${BACKEND_HOST}/refresh-token`, {
             method:  "POST",
             headers: { "Content-Type": "application/json" },
-            body:    JSON.stringify({ username: currentUsername }),
+            body:    JSON.stringify({ username: currentUsername, token: sessionToken }),
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "Token refresh failed");
@@ -2375,7 +2384,7 @@ async function initApp() {
 
 async function checkBackendHealth() {
     try {
-        const res = await fetch(`${HTTP_PROTOCOL}//${BACKEND_HOST}/health`);
+        const res = await backendFetch(`${HTTP_PROTOCOL}//${BACKEND_HOST}/health`);
         if (!res.ok) throw new Error("Health check failed");
         return true;
     } catch (e) {
@@ -2390,7 +2399,7 @@ async function checkBackendHealth() {
                 // Poll automatically so they don't have to refresh
                 const pollTimer = setInterval(async () => {
                     try {
-                        const check = await fetch(`${HTTP_PROTOCOL}//${BACKEND_HOST}/health`);
+                        const check = await backendFetch(`${HTTP_PROTOCOL}//${BACKEND_HOST}/health`);
                         if (check.ok) {
                             clearInterval(pollTimer);
                             overlay.classList.add("hidden");

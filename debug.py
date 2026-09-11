@@ -1,24 +1,23 @@
-import paramiko
-import sys
+import shlex
 
-client = paramiko.SSHClient()
-client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-client.connect(hostname="10.1.75.53", port=2237, username="student", password="12342090")
+from lab_config import BACKEND_URLS, SYS1_SSH_PORT, connect_ssh
 
-print("Checking hosts file...")
-stdin, stdout, stderr = client.exec_command("cat /etc/hosts")
-print(stdout.read().decode())
+client = connect_ssh(SYS1_SSH_PORT)
 
-print("Checking curl to sys2...")
-stdin, stdout, stderr = client.exec_command("curl -v http://sys2:8081/health")
-print(stderr.read().decode())
+try:
+    print("Checking hosts file...")
+    stdin, stdout, stderr = client.exec_command("cat /etc/hosts")
+    print(stdout.read().decode())
 
-print("Checking curl to 10.1.75.53:8081...")
-stdin, stdout, stderr = client.exec_command("curl -v http://10.1.75.53:8081/health")
-print(stderr.read().decode())
-
-print("Checking curl to 10.1.75.53:8000...")
-stdin, stdout, stderr = client.exec_command("curl -v http://10.1.75.53:8000/health")
-print(stderr.read().decode())
-
-client.close()
+    for backend_url in BACKEND_URLS:
+        health_url = backend_url.rstrip("/") + "/health"
+        print(f"Checking {health_url}...")
+        stdin, stdout, stderr = client.exec_command(
+            f"curl -k --fail --show-error --silent {shlex.quote(health_url)}"
+        )
+        print(stdout.read().decode())
+        error = stderr.read().decode()
+        if error:
+            print(error)
+finally:
+    client.close()

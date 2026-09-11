@@ -22,6 +22,7 @@ A **real-time, secure, gamified group chat** built with **FastAPI WebSockets** (
 12. [Environment Configuration](#environment-configuration)
 13. [Quick Start (Local)](#quick-start-local)
 14. [Multi-Machine Deployment](#multi-machine-deployment)
+15. [Lab 5 Load-Balanced Deployment](#lab-5-load-balanced-deployment)
 
 ---
 
@@ -35,7 +36,7 @@ A **real-time, secure, gamified group chat** built with **FastAPI WebSockets** (
 - **Security Badge Per Message** — Each message bubble displays one of: `🔒✓ VERIFIED`, `⚠ SIG INVALID`, or `🚨 TAMPERED` based on server-side verification.
 - **TLS/HTTPS + WSS** — Both frontend and backend run with self-signed SSL certificates (`cert.pem` / `key.pem`) so the Web Crypto API is available in all browsers (requires HTTPS context).
 - **bcrypt Password Hashing** — User passwords are hashed with bcrypt (salted) before storage. The plaintext password is never stored.
-- **One-Time Session Tokens** — After login or register, the server issues a single-use opaque token (`secrets.token_hex(32)`). The token is consumed when the WebSocket connection is established, preventing replay attacks.
+- **Expiring Session Tokens** — Login and registration issue opaque, time-limited tokens. They remain valid across WebSocket reconnects and browser tabs until expiry or authenticated rotation.
 - **Whisper (Private Message) Privacy** — Private messages sent via `/w @username` are stored in the DB but only returned to the sender and recipient in history queries.
 
 ### 💬 Messaging Features
@@ -70,7 +71,7 @@ A **real-time, secure, gamified group chat** built with **FastAPI WebSockets** (
 - **Avatar Picker** — 12 pre-built pixel avatars: Wizard, Robot, Ninja, Astronaut, Dragon, Hero, Alien, Cyber, Fox, Owl, Bear, Lion.
 - **Username Validation** — 1–20 characters, alphanumeric + underscore only. Case-insensitive uniqueness enforced.
 - **Logout** — Cleanly returns user to login screen without losing the session state.
-- **Token Refresh** — Returning to lobby (after leaving a room) issues a new one-time token without requiring re-login.
+- **Authenticated Token Rotation** — Returning to the lobby rotates the current valid token without requiring the password again; a token cannot be refreshed for another user.
 
 ### 🎮 Gamification
 
@@ -270,7 +271,7 @@ Login:
 
 WebSocket Join:
   WS send: { type: "join", token, public_key (JWK), room_id }
-  Server: active_sessions.pop(token)  ← token consumed (one-time use)
+  Server: validates the token, owner, and expiry (the token remains reusable for reconnect)
   → validate room, register ECDSA key, send history + welcome
 ```
 
@@ -445,7 +446,7 @@ All messages are JSON with a `type` field. Transport is `wss://` (encrypted WebS
 | `GET` | `/uploads/<filename>` | Serve uploaded file (static) |
 | `GET` | `/group-key` | Return AES-256 group key (hex) from `.env` |
 | `GET` | `/users/{username}/xp` | Return user's current XP total |
-| `GET` | `/config.js` | Serve `window.PORT = <backend_port>;` for dynamic client config |
+| `GET` | `/config.js` | Serve `window.BACKEND_PORT = <load_balancer_port>;` for dynamic client config |
 | `GET` | `/health` | Health check — `{"status": "ok"}` |
 
 ---
@@ -485,6 +486,15 @@ group-chat-app/
 ├── .gitignore
 ├── README.md
 ├── generate_certs.py           # RSA-2048 self-signed TLS cert generator
+├── go.mod
+├── cmd/                        # Go CLI entry points
+│   ├── load-balancer/
+│   └── load-generator/
+├── internal/                   # Tested load-balancer and generator packages
+│   ├── loadbalancer/
+│   └── loadgenerator/
+├── run_experiments.sh          # One-backend vs three-backend experiment
+├── deploy_and_run.py           # Sys1-Sys4 deployment automation
 ├── cert.pem                    # TLS certificate (generated, gitignored)
 ├── key.pem                     # TLS private key (generated, gitignored)
 ├── architecture_diagram.jpg    # System architecture reference image
@@ -536,11 +546,24 @@ group-chat-app/
 Copy `.env.example` to `.env` and fill in secrets:
 
 ```env
-# Backend (FastAPI WebSocket server) port
-BACKEND_PORT=5000
+# Backend process port on Sys2, Sys3, and Sys4
+PORT=5000
+
+# Public load-balancer port advertised to the browser (Sys1 SSH 2237)
+BACKEND_PORT=4237
+
+# Load-balancer port inside the Sys1 container
+LB_PORT=4000
+PUBLIC_LB_PORT=4237
 
 # Frontend (static file server) port
-FRONTEND_PORT=3269
+FRONTEND_PORT=3000
+
+# Keep enabled outside local smoke tests
+FRONTEND_TLS=1
+
+# Authenticated session lifetime (seconds)
+SESSION_TTL_SECONDS=43200
 
 # Room cleanup timeout in seconds (default 300)
 CLEANUP_TIMEOUT=300
@@ -592,10 +615,10 @@ cd server
 python3 server.py
 ```
 
-Server starts on configured `BACKEND_PORT`:
-- **WebSocket**: `wss://0.0.0.0:<BACKEND_PORT>/ws`
-- **API**: `https://0.0.0.0:<BACKEND_PORT>/rooms`, `/login`, `/register`, etc.
-- **Uploads**: `https://0.0.0.0:<BACKEND_PORT>/uploads/<file>`
+Server starts on configured `PORT`:
+- **WebSocket**: `wss://0.0.0.0:<PORT>/ws`
+- **API**: `https://0.0.0.0:<PORT>/rooms`, `/login`, `/register`, etc.
+- **Uploads**: `https://0.0.0.0:<PORT>/uploads/<file>`
 
 ### 5. Start the Frontend (Terminal 2)
 
@@ -625,6 +648,42 @@ https://localhost:<FRONTEND_PORT>
 3. The frontend fetches `/config.js` which injects `window.BACKEND_PORT`. The client derives the WebSocket URL as `wss://<same-hostname>:<BACKEND_PORT>/ws`. **No client-side configuration needed.**
 
 > New clients may need to accept the self-signed TLS cert for both ports on first visit. The app's certificate overlay guides users through this step automatically.
+
+---
+
+## Lab 5 Load-Balanced Deployment
+
+The Lab 5 topology runs the Go reverse proxy on Sys1, identical FastAPI backends on Sys2-Sys4, and the static frontend on Sys1. Browser-affinity cookies keep a user's REST and WebSocket traffic on one backend while new sessions are distributed round-robin. Failed health checks remove a backend from rotation and successful checks restore it.
+
+Build and test locally:
+
+```bash
+go test ./...
+go vet ./...
+go build ./...
+go run ./cmd/load-balancer -backends https://sys2:5000,https://sys3:5000,https://sys4:5000 -port 4000 -backend-insecure-skip-verify
+```
+
+The lab maps Sys1 container port `3000` to public port `3237`, and container
+port `4000` to public port `4237`. The frontend therefore advertises `4237`
+to browsers while the load balancer listens on `4000`. Sys1 reaches the three
+backends directly over the Docker bridge on their internal port `5000`; it
+does not hairpin through public ports `5238`, `5239`, and `5240`.
+
+Run the controlled comparison from the local workstation through the mapped
+load-balancer port after configuring SSH credentials:
+
+```bash
+python tools/run_mapped_experiments.py
+```
+
+The older Sys1-local reproduction script remains available when required:
+
+```bash
+./run_experiments.sh
+```
+
+The script uses the same request count, concurrency, endpoint, and timeout for the one-backend and three-backend runs, waits for health readiness, and writes JSON/CSV results. `deploy_and_run.py` uploads the source, starts all three backends, builds the Go programs on Sys1, starts the load balancer, and serves the frontend through the load-balancer port.
 
 ---
 

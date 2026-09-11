@@ -1,9 +1,11 @@
-import paramiko
+import argparse
 import sys
 import threading
 import select
 import socket
 import socketserver
+
+from lab_config import SYS1_SSH_PORT, connect_ssh
 
 def handler(chan, host, port):
     sock = socket.socket()
@@ -19,11 +21,11 @@ def handler(chan, host, port):
         if sock in r:
             data = sock.recv(1024)
             if len(data) == 0: break
-            chan.send(data)
+            chan.sendall(data)
         if chan in r:
             data = chan.recv(1024)
             if len(data) == 0: break
-            sock.send(data)
+            sock.sendall(data)
     chan.close()
     sock.close()
     print("Tunnel closed")
@@ -35,7 +37,7 @@ def reverse_forward_tunnel(server_port, remote_host, remote_port, transport):
         if chan is None:
             continue
         thr = threading.Thread(target=handler, args=(chan, remote_host, remote_port))
-        thr.setDaemon(True)
+        thr.daemon = True
         thr.start()
 
 def forward_tunnel(local_port, remote_host, remote_port, transport):
@@ -54,26 +56,43 @@ def forward_tunnel(local_port, remote_host, remote_port, transport):
                 if self.request in r:
                     data = self.request.recv(1024)
                     if len(data) == 0: break
-                    chan.send(data)
+                    chan.sendall(data)
                 if chan in r:
                     data = chan.recv(1024)
                     if len(data) == 0: break
-                    self.request.send(data)
+                    self.request.sendall(data)
             chan.close()
             self.request.close()
     
-    class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer): pass
-    server = ThreadingTCPServer(('', local_port), SubHander)
+    class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    server = ThreadingTCPServer(('127.0.0.1', local_port), SubHander)
     server.serve_forever()
 
 if __name__ == '__main__':
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    parser = argparse.ArgumentParser(description="Forward a local port to a service on Sys1.")
+    parser.add_argument("--local-port", type=int, default=8082)
+    parser.add_argument("--remote-port", type=int, default=4000)
+    parser.add_argument("--remote-host", default="127.0.0.1")
+    parser.add_argument("--ssh-port", type=int, default=SYS1_SSH_PORT)
+    args = parser.parse_args()
+
     print("Connecting...")
-    client.connect('10.1.75.53', 2237, username='student', password='12342090')
-    print("Port forwarding 8080 -> 10.1.75.53:8080")
+    client = connect_ssh(args.ssh_port)
+    print(
+        f"Port forwarding 127.0.0.1:{args.local_port} -> "
+        f"{args.remote_host}:{args.remote_port}"
+    )
     try:
-        forward_tunnel(8080, '127.0.0.1', 8080, client.get_transport())
+        forward_tunnel(
+            args.local_port,
+            args.remote_host,
+            args.remote_port,
+            client.get_transport(),
+        )
     except KeyboardInterrupt:
         print("Exiting...")
+        client.close()
         sys.exit(0)

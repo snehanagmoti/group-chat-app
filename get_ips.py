@@ -1,15 +1,23 @@
-import paramiko
+from lab_config import (
+    SYS1_SSH_PORT,
+    SYS2_SSH_PORT,
+    SYS3_SSH_PORT,
+    SYS4_SSH_PORT,
+    connect_ssh,
+)
 
 def get_ip(port):
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(hostname="10.1.75.53", port=port, username="student", password="12342090")
-    stdin, stdout, stderr = client.exec_command("hostname -I")
-    ip = stdout.read().decode().strip().split()[0]
-    client.close()
-    return ip
+    client = connect_ssh(port)
+    try:
+        stdin, stdout, stderr = client.exec_command("hostname -I")
+        addresses = stdout.read().decode().strip().split()
+        if not addresses:
+            raise RuntimeError(f"No IP address returned for SSH port {port}")
+        return addresses[0]
+    finally:
+        client.close()
 
-print("sys1 IP:", get_ip(2237))
-print("sys2 IP:", get_ip(2238))
-print("sys3 IP:", get_ip(2239))
-print("sys4 IP:", get_ip(2240))
+print("sys1 IP:", get_ip(SYS1_SSH_PORT))
+print("sys2 IP:", get_ip(SYS2_SSH_PORT))
+print("sys3 IP:", get_ip(SYS3_SSH_PORT))
+print("sys4 IP:", get_ip(SYS4_SSH_PORT))

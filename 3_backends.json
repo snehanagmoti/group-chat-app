@@ -1,1 +1,13 @@
-{"concurrency":200,"dropout_percent":0.66,"experiment":"3_backends","failed":33,"p50_ms":398,"p95_ms":1198,"p99_ms":2695,"requests":5000,"successful":4967,"throughput_rps":371.76145945518874}
+{
+  "concurrency": 200,
+  "dropout_percent": 0,
+  "elapsed_seconds": 10.986005127,
+  "experiment": "3_backends",
+  "failed": 0,
+  "p50_ms": 307.57852,
+  "p95_ms": 902.649287,
+  "p99_ms": 2522.560466,
+  "requests": 5000,
+  "successful": 5000,
+  "throughput_rps": 455.12449176922723
+}
