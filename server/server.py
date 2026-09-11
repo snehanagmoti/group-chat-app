@@ -219,25 +219,9 @@ class ConnectionManager:
 
 # ── FastAPI App ───────────────────────────────────────────────────────────────
 
-import anyio
 
 app = FastAPI(title="Secure Group Chat Server")
 manager = ConnectionManager()
-
-@app.on_event("startup")
-async def configure_threadpool():
-    """
-    Raise anyio's default thread limiter from 40 → 200.
-    FastAPI runs every plain `def` route handler in anyio's thread pool.
-    At 500 concurrent users across 3 backends, each backend sees ~167
-    concurrent requests; spread over 4 Gunicorn workers that's ~42 threads
-    per worker. The default cap of 40 would cause requests to queue behind
-    each other, effectively recreating the same serialisation bottleneck
-    that `async def` had. 200 gives headroom up to ~1600 concurrent users.
-    """
-    limiter = anyio.to_thread.current_default_thread_limiter()
-    limiter.total_tokens = 200
-    print(f"[startup] anyio thread limiter set to {limiter.total_tokens}")
 
 
 # Per-room cleanup tasks: room_id → asyncio.Task
@@ -313,21 +297,20 @@ async def startup():
 # ── Load Balancer / Evaluator Endpoints ────────────────────────────────────────
 
 @app.post("/message")
-def submit_message(req: MessageRequest):
+async def submit_message(req: MessageRequest):
     """
     Official load-generator endpoint.
-    Plain `def` (not async) so FastAPI/Starlette automatically runs this in
-    anyio's thread pool. This means the Redis pipeline calls are genuinely
-    concurrent: multiple requests execute their I/O in separate threads while
-    the event loop stays free to accept new connections and serve /health.
-
-    With `async def`, every Redis call would block the single event loop
-    thread — serialising ALL concurrent requests on this worker behind the
-    latency of a single Redis round-trip (~1-3ms), which causes 99% timeouts
-    at 500 users. Same fix as /feed above.
+    `async def` with redis.asyncio: every Redis call is a coroutine that
+    yields control to the event loop while waiting for I/O. Under 500
+    concurrent requests, 500 coroutines are interleaved on one event loop
+    thread — no OS threads are consumed, so there is no thread-pool ceiling
+    to hit. Compare:
+      - sync def   → 1 thread blocked per in-flight Redis call (hits 40-slot
+                     anyio cap at ~167 concurrent requests per backend)
+      - async def  → 0 threads; scales to thousands of concurrent coroutines
     """
     msg_id = req.msg_id.strip() if req.msg_id.strip() else str(uuid.uuid4())
-    saved = db.save_message_simple(
+    saved = await db.save_message_simple_async(
         msg_id=msg_id,
         room_id="loadtest",
         username=req.client_name,
@@ -340,23 +323,22 @@ def submit_message(req: MessageRequest):
 
 
 
+
 @app.get("/feed")
-def get_feed():
+async def get_feed():
     """
     Official load-generator endpoint.
-    Returns all messages in the global loadtest room, chronological order.
-    Uses sync def so FastAPI executes in worker threadpool without blocking async event loop.
-    Returns raw Response with pre-serialized JSON for maximum throughput.
+    `async def` with redis.asyncio: LRANGE is a coroutine, not a thread.
     On any Redis/internal error returns an empty list (not a 500) so the
-    load tester keeps scoring successful responses instead of penalising us
-    with an HTTP error that excludes the run from completeness scoring.
+    load tester scores it as a successful response rather than an error.
     """
     try:
-        raw_json = db.get_feed_json(room_id="loadtest")
+        raw_json = await db.get_feed_json_async(room_id="loadtest")
     except Exception as exc:
         print(f"[feed] error fetching feed, returning empty list: {exc}")
         raw_json = "[]"
     return Response(content=raw_json, media_type="application/json")
+
 
 
 

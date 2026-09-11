@@ -23,6 +23,7 @@ import json
 import uuid
 import time
 import redis
+import redis.asyncio as aioredis
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -68,6 +69,33 @@ _ro = redis.from_url(
     socket_connect_timeout=2,
     health_check_interval=30,
     retry_on_timeout=True,
+)
+
+# ── Async Redis clients (used ONLY by /message and /feed hot paths) ───────────
+# redis.asyncio uses the event loop for I/O instead of OS threads:
+#   - sync client: 1 blocked OS thread per in-flight Redis call
+#   - async client: 0 OS threads — I/O is multiplexed on the event loop
+# At 500 concurrent users, the sync approach needed 167 thread slots per
+# backend; async needs 0, so the thread-pool ceiling is no longer a factor.
+_rw_async = aioredis.from_url(
+    _primary_url,
+    decode_responses=False,
+    socket_timeout=10,
+    socket_connect_timeout=2,
+    health_check_interval=30,
+    retry_on_timeout=True,
+    max_connections=64,        # generous pool; async connections are cheap
+)
+
+# Async read client — local replica (kept for future /feed replica reads).
+_ro_async = aioredis.from_url(
+    _replica_url,
+    decode_responses=False,
+    socket_timeout=10,
+    socket_connect_timeout=2,
+    health_check_interval=30,
+    retry_on_timeout=True,
+    max_connections=64,
 )
 
 # HMAC_SECRET loaded from environment (set in .env, never hardcoded)
@@ -525,6 +553,117 @@ def get_feed_json(room_id: str = "loadtest") -> str:
 def get_all_messages_simple(room_id: str = "loadtest") -> list[dict]:
     """Compatibility helper returning parsed Python dicts."""
     return json.loads(get_feed_json(room_id))
+
+
+# ── Async hot-path functions (event-loop native, 0 threads) ───────────────────
+
+async def save_message_simple_async(
+    msg_id: str, room_id: str, username: str, text: str
+) -> bool:
+    """
+    Async version of save_message_simple for the /message load-test endpoint.
+
+    Uses _rw_async (redis.asyncio) so every Redis call is a coroutine that
+    suspends with `await` instead of blocking an OS thread. Under 500
+    concurrent requests this means 500 coroutines interleaved on the event
+    loop — not 500 threads stacked in the kernel.
+
+    Logic is identical to the sync version:
+      1. HSETNX for atomic dedup (returns False immediately if duplicate).
+      2. 4-command pipeline: HSET + ZADD×2 + RPUSH — all sent in one
+         round-trip, minimising latency per request.
+    """
+    key = f"msg:{msg_id}"
+    inserted = await _rw_async.hsetnx(key, "username", username)
+    if not inserted:
+        return False  # duplicate — already stored
+
+    ts = time.time()
+    msg_dict = {
+        "msg_id":      msg_id,
+        "client-name": username,
+        "msg":         text,
+        "timestamp":   str(ts),
+    }
+    msg_json = json.dumps(msg_dict)
+
+    # In redis.asyncio, pipeline commands are queued synchronously;
+    # only execute() is awaited (sends the batch and reads all replies).
+    pipe = _rw_async.pipeline(transaction=False)
+    pipe.hset(key, mapping={
+        "room_id":   room_id,
+        "text":      text,
+        "timestamp": ts,
+        "simple":    1,
+        "json":      msg_json,
+    })
+    pipe.zadd("feed:all", {msg_id: ts})
+    pipe.zadd(f"feed:room:{room_id}", {msg_id: ts})
+    pipe.rpush(f"feed:list:{room_id}", msg_json)
+    await pipe.execute(raise_on_error=True)  # surface OOM errors, don't swallow them
+    return True
+
+
+async def get_feed_json_async(room_id: str = "loadtest") -> str:
+    """
+    Async version of get_feed_json for the /feed load-test endpoint.
+
+    Shares _feed_cache with the sync version: a 250ms micro-cache that
+    absorbs concurrent reader bursts (multiple coroutines hitting /feed at
+    the same instant all get the cached string instead of all racing to
+    LRANGE Redis simultaneously).
+    """
+    now = time.time()
+    cached = _feed_cache.get(room_id)
+    if cached and (now - cached[0] < _CACHE_TTL_SEC):
+        return cached[1]
+
+    # Fast path: single LRANGE fetches pre-serialised JSON blobs stored by
+    # save_message_simple_async. Joins them into a valid JSON array without
+    # any Python-side JSON parsing or serialisation.
+    raw_list = await _rw_async.lrange(f"feed:list:{room_id}", 0, -1)
+    if raw_list:
+        body = b"[" + b",".join(raw_list) + b"]"
+        json_str = body.decode("utf-8")
+        _feed_cache[room_id] = (now, json_str)
+        return json_str
+
+    # Fallback / backfill: handles messages written by the sync version or
+    # pre-existing data that lacks feed:list entries.
+    ids = await _rw_async.zrange(f"feed:room:{room_id}", 0, -1)
+    if not ids:
+        empty = "[]"
+        _feed_cache[room_id] = (now, empty)
+        return empty
+
+    pipe = _rw_async.pipeline(transaction=False)
+    for mid in ids:
+        pipe.hgetall(f"msg:{mid.decode()}")
+    rows = await pipe.execute()
+
+    items = []
+    pipe_backfill = _rw_async.pipeline(transaction=False)
+    for mid, fields in zip(ids, rows):
+        if not fields:
+            continue
+        f = {k.decode(): v.decode() for k, v in fields.items()}
+        jstr = f.get("json") or json.dumps({
+            "msg_id":      mid.decode(),
+            "client-name": f.get("username", ""),
+            "msg":         f.get("text", ""),
+            "timestamp":   f.get("timestamp", ""),
+        })
+        items.append(jstr.encode("utf-8") if isinstance(jstr, str) else jstr)
+        pipe_backfill.rpush(f"feed:list:{room_id}", jstr)
+    try:
+        await pipe_backfill.execute()
+    except Exception:
+        pass  # backfill is best-effort; don't let it break the read
+
+    body = b"[" + b",".join(items) + b"]"
+    json_str = body.decode("utf-8")
+    _feed_cache[room_id] = (now, json_str)
+    return json_str
 
 
 # ── User key registry ─────────────────────────────────────────────────────────
