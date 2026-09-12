@@ -26,13 +26,13 @@ def restore_three_backend_load_balancer(client) -> None:
         client,
         f"cd {REMOTE_ROOT} && setsid -f ./load_balancer "
         f"-backends {shlex.quote(backends)} -port {LB_PORT} "
-        "-backend-insecure-skip-verify -tls-cert cert.pem -tls-key key.pem "
+        "-backend-insecure-skip-verify "
         "> lb.log 2>&1 < /dev/null",
     )
     time.sleep(2)
     ssh_exec(
         client,
-        f"curl -k --fail --silent --show-error https://127.0.0.1:{LB_PORT}/lb/health",
+        f"curl --fail --silent --show-error http://127.0.0.1:{LB_PORT}/lb/health",
     )
 
 
@@ -64,8 +64,6 @@ def check_backends() -> bool:
 def upload_experiment_sources(client) -> None:
     upload_file(client, "go.mod", f"{REMOTE_ROOT}/go.mod")
     upload_file(client, "run_experiments.sh", f"{REMOTE_ROOT}/run_experiments.sh")
-    upload_file(client, "cert.pem", f"{REMOTE_ROOT}/cert.pem")
-    upload_file(client, "key.pem", f"{REMOTE_ROOT}/key.pem")
     upload_tree(client, "cmd/load-balancer", f"{REMOTE_ROOT}/cmd/load-balancer")
     upload_tree(client, "cmd/load-generator", f"{REMOTE_ROOT}/cmd/load-generator")
     upload_tree(client, "internal/loadbalancer", f"{REMOTE_ROOT}/internal/loadbalancer")

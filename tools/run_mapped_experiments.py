@@ -30,7 +30,7 @@ from lab_config import (
 )
 
 
-PUBLIC_LB_URL = f"https://{LAB_HOST}:{SYS1_LB_PUBLIC_PORT}"
+PUBLIC_LB_URL = f"http://{LAB_HOST}:{SYS1_LB_PUBLIC_PORT}"
 RESULT_FILES = (
     "results.csv",
     "1_backend.json",
@@ -68,13 +68,13 @@ def start_load_balancer(ssh, backends: list[str], client: httpx.Client) -> None:
         ssh,
         f"cd {REMOTE_ROOT} && setsid -f ./load_balancer "
         f"-backends {backend_argument} -port {LB_PORT} "
-        "-backend-insecure-skip-verify -tls-cert cert.pem -tls-key key.pem "
+        "-backend-insecure-skip-verify "
         "> lb.log 2>&1 < /dev/null",
     )
     time.sleep(2)
     ssh_exec(
         ssh,
-        f"curl -k --fail --silent --show-error https://127.0.0.1:{LB_PORT}/lb/health",
+        f"curl --fail --silent --show-error http://127.0.0.1:{LB_PORT}/lb/health",
     )
     wait_for_public_health(client)
 
@@ -118,7 +118,6 @@ def run_experiment(
             f"{name}.json",
             "-csv",
             "results.csv",
-            "-insecure",
         ],
         cwd=PROJECT_ROOT,
         check=True,
@@ -145,7 +144,7 @@ def main() -> int:
         (PROJECT_ROOT / name).unlink(missing_ok=True)
 
     ssh = connect_ssh(SYS1_SSH_PORT)
-    with httpx.Client(verify=False, trust_env=False, timeout=10) as client:
+    with httpx.Client(trust_env=False, timeout=10) as client:
         try:
             run_experiment(
                 "1_backend",

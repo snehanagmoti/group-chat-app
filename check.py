@@ -5,7 +5,7 @@ from lab_config import connect_ssh, SYS1_SSH_PORT, SYS2_SSH_PORT
 # 1. Check /lb/status (per-backend info)
 client = connect_ssh(SYS1_SSH_PORT)
 print("=== LB Status (per-backend) ===")
-stdin, stdout, stderr = client.exec_command("curl -k --fail --silent https://127.0.0.1:4000/lb/status")
+stdin, stdout, stderr = client.exec_command("curl --fail --silent http://127.0.0.1:4000/lb/status")
 print(stdout.read().decode()[:2000])
 
 # 2. Test WebSocket on backend with python websockets
@@ -44,7 +44,7 @@ print("\n=== Verifying exact /message and /feed routes ===")
 
 # POST /message
 stdin3, stdout3, stderr3 = client.exec_command(
-    'curl -k --silent -w "\\nHTTP_CODE:%{http_code}" -X POST https://127.0.0.1:4000/message '
+    'curl --silent -w "\\nHTTP_CODE:%{http_code}" -X POST http://127.0.0.1:4000/message '
     '-H "Content-Type: application/json" '
     '-d \'{"client-name": "teacher_test", "msg": "verification message"}\''
 )
@@ -53,7 +53,7 @@ print(f"POST /message: {result}")
 
 # GET /feed  
 stdin4, stdout4, stderr4 = client.exec_command(
-    'curl -k --silent -w "\\nHTTP_CODE:%{http_code}" https://127.0.0.1:4000/feed'
+    'curl --silent -w "\\nHTTP_CODE:%{http_code}" http://127.0.0.1:4000/feed'
 )
 result = stdout4.read().decode()
 # Just show first 500 chars + http code
@@ -67,7 +67,7 @@ print(f"\n=== Testing PUBLIC Load Balancer URL ===")
 from lab_config import SYS1_LB_PUBLIC_PORT
 print(f"Public LB port: {SYS1_LB_PUBLIC_PORT}")
 stdin5, stdout5, stderr5 = client.exec_command(
-    f'curl -k --silent -w "\\nHTTP_CODE:%{{http_code}}" -X POST https://127.0.0.1:4000/message '
+    f'curl --silent -w "\\nHTTP_CODE:%{{http_code}}" -X POST http://127.0.0.1:4000/message '
     f'-H "Content-Type: application/json" '
     f'-d \'{{"client-name": "public_test", "msg": "public verification"}}\''
 )

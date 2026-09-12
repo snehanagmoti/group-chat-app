@@ -62,9 +62,9 @@ def probe(system: System) -> None:
                 [
                     ("frontend", "curl -k -sS -o /dev/null -w '%{http_code}' https://127.0.0.1:3000/"),
                     ("frontend config", f"curl -k -sS https://127.0.0.1:3000/config.js | grep -F 'BACKEND_PORT = {SYS1_LB_PUBLIC_PORT}'"),
-                    ("LB health", "curl -k -sS https://127.0.0.1:4000/lb/health"),
-                    ("LB status", "curl -k -sS https://127.0.0.1:4000/lb/status"),
-                    ("LB metrics", "curl -k -sS https://127.0.0.1:4000/lb/metrics"),
+                    ("LB health", "curl -sS http://127.0.0.1:4000/lb/health"),
+                    ("LB status", "curl -sS http://127.0.0.1:4000/lb/status"),
+                    ("LB metrics", "curl -sS http://127.0.0.1:4000/lb/metrics"),
                     ("LB log tail", "tail -n 30 group-chat-app/lb.log"),
                     ("frontend log tail", "tail -n 20 group-chat-app/frontend.log"),
                 ]
