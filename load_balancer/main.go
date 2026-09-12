@@ -626,7 +626,7 @@ func main() {
 	port            := flag.Int("port", 8080, "Port for Load Balancer to listen on (Sys1)")
 	backendsArg     := flag.String("backends", "http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083", "Comma-separated list of backend URLs")
 	healthInterval  := flag.Duration("health-interval", 1*time.Second, "Interval between background health checks")
-	backendTimeout  := flag.Duration("backend-timeout", 800*time.Millisecond, "Backend request timeout")
+	backendTimeout  := flag.Duration("backend-timeout", 8*time.Second, "Backend request timeout")
 	overloadThresh  := flag.Float64("overload-threshold", defaultOverloadThreshold, "LoadScore above which a backend is considered overloaded")
 	hysteresis      := flag.Float64("hysteresis", defaultHysteresis, "Min score gap required to switch backends (prevents flapping)")
 

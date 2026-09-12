@@ -541,30 +541,61 @@ async def save_plain_message(client_name: str, msg: str, msg_id: str = "") -> st
 async def get_feed(limit: int = 0) -> list[dict]:
     """
     Retrieve plain-text messages for the GET /feed endpoint.
-    Served from LOCAL Valkey — in-memory, sub-millisecond latency.
 
-    limit=0 (default) means return ALL messages — required for the professor's
-    completeness check which verifies every posted message appears in /feed.
-    A positive limit (e.g. 200) returns only the last N messages.
+    Reads from ALL Valkey instances in parallel and merges by msg_id.
+    This is critical for correctness: the LB distributes POST /message
+    across all 3 backends. Each backend writes locally first (fast) and
+    replicates to siblings asynchronously (fire-and-forget). Under load,
+    replication may lag. If GET /feed only reads from local Valkey, it
+    misses messages that were accepted by other backends and not yet
+    replicated → 0% completeness in the professor's evaluation.
+
+    By reading from ALL Valkeys and deduplicating by msg_id, we always
+    return the full picture regardless of replication lag.
+
+    limit=0 (default) → return ALL messages.
+    limit=N → return last N messages sorted by timestamp.
     """
-    if limit > 0:
-        start_idx = -limit
-    else:
-        start_idx = 0   # 0 to -1 = ALL elements in ZRANGE
-
-    msg_ids = await _local().zrange(f"room:{_FEED_ROOM}:timeline", start_idx, -1)
-    if not msg_ids:
+    if not _clients:
         return []
-    raw_list = await _local().hmget(f"room:{_FEED_ROOM}:messages_hash", *msg_ids)
-    messages = []
-    for raw in raw_list:
-        if not raw:
-            continue
+
+    async def _fetch_from(client: valkey_lib.Valkey) -> list[dict]:
+        """Fetch all messages from one Valkey instance."""
         try:
-            messages.append(json.loads(raw))
-        except json.JSONDecodeError:
-            continue
-    return messages
+            msg_ids = await client.zrange(f"room:{_FEED_ROOM}:timeline", 0, -1)
+            if not msg_ids:
+                return []
+            raw_list = await client.hmget(f"room:{_FEED_ROOM}:messages_hash", *msg_ids)
+            result = []
+            for raw in raw_list:
+                if not raw:
+                    continue
+                try:
+                    result.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    continue
+            return result
+        except Exception as e:
+            print(f"[DB] get_feed fetch from sibling failed (non-fatal): {e}")
+            return []
+
+    # Fetch from all Valkey nodes in parallel
+    results = await asyncio.gather(*[_fetch_from(c) for c in _clients])
+
+    # Merge and deduplicate by msg_id, keeping canonical (first-seen) entry
+    seen: dict[str, dict] = {}
+    for batch in results:
+        for msg in batch:
+            mid = msg.get("msg_id")
+            if mid and mid not in seen:
+                seen[mid] = msg
+
+    # Sort chronologically by created_at timestamp
+    merged = sorted(seen.values(), key=lambda m: m.get("created_at", 0))
+
+    if limit > 0:
+        return merged[-limit:]
+    return merged
 
 
 # ── User key registry ──────────────────────────────────────────────────────────
