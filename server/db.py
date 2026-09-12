@@ -447,12 +447,13 @@ def edit_message(
 
 _feed_cache: dict[str, tuple[float, str, int]] = {}
 _CACHE_TTL_SEC = 0.25  # 250ms micro-cache coalesces high-concurrency read spikes
-# Per-room lock used to single-flight cache misses in get_feed_json_async.
-# Without this, when the cache entry expires every concurrent /feed coroutine
-# that arrives in that sub-250ms window independently fires its own full
-# LRANGE. With the lock, only one coroutine runs the LRANGE; every other waiter
-# re-checks the cache after acquiring and returns the already-populated entry.
-_feed_lock: dict[str, asyncio.Lock] = {}
+# Per-room in-flight Task used to single-flight cache misses in get_feed_json_async.
+# When the cache expires under high concurrency, ONE Task is created to do the
+# actual LRANGE+merge; every other coroutine awaits the *same* Task object.
+# asyncio wakes all awaiters simultaneously when the Task resolves — no FIFO
+# lock convoy, no per-waiter task-switch overhead. Compare with asyncio.Lock,
+# which serialises every waiter through acquire/check/release one at a time.
+_feed_inflight: dict[str, asyncio.Task] = {}
 
 def _append_items(prev_json: str, new_items: list[bytes]) -> str:
     """
@@ -626,60 +627,41 @@ async def save_message_simple_async(
     return True
 
 
-async def get_feed_json_async(room_id: str = "loadtest") -> str:
+async def _refresh_feed(room_id: str) -> str:
     """
-    Async version of get_feed_json for the /feed load-test endpoint.
+    Worker coroutine that runs as a shared asyncio.Task per room.
+    All concurrent /feed requests for the same room_id await THIS same Task
+    object — asyncio broadcasts the result to all awaiters at once when the
+    Task resolves (fan-out), rather than serialising them through a Lock.
 
-    Uses incremental delta caching + per-room asyncio.Lock:
-      - Warm cache (< 250ms): returns cached string immediately (0 Redis I/O).
-      - On miss, acquires per-room lock so only ONE coroutine queries Redis.
-      - Waiters re-check cache upon acquisition and return without querying Redis.
-      - The winner fetches ONLY the delta: LRANGE feed:list:{room_id} prev_len -1.
-      - Merges new items into the cached JSON string in O(delta) time/memory
-        instead of re-fetching and re-serializing the entire list from scratch.
+    Error handling: catches ALL exceptions internally and falls back to the
+    stale cache. This is critical — if the Task were to raise, asyncio would
+    re-raise the exception in EVERY coroutine awaiting it, causing a cascade
+    of HTTP 500s on a single Redis blip. By returning the stale string on
+    error, we degrade gracefully instead.
     """
-    now = time.time()
     cached = _feed_cache.get(room_id)
-    if cached and (now - cached[0] < _CACHE_TTL_SEC):
-        return cached[1]  # fast path: warm cache
+    prev_ts, prev_json, prev_len = cached if (cached and len(cached) >= 3) else (0.0, "[]", 0)
 
-    lock = _feed_lock.get(room_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _feed_lock[room_id] = lock
+    try:
+        # Incremental fetch: only new items since the last cached length.
+        new_items = await _rw_async.lrange(f"feed:list:{room_id}", prev_len, -1)
 
-    async with lock:
-        cached = _feed_cache.get(room_id)
-        if cached and (time.time() - cached[0] < _CACHE_TTL_SEC):
-            return cached[1]
+        # Detect external flush (DEL between test runs) — reset and reload.
+        if not new_items and prev_len > 0:
+            current_len = await _rw_async.llen(f"feed:list:{room_id}")
+            if current_len < prev_len:
+                prev_len = 0
+                prev_json = "[]"
+                new_items = await _rw_async.lrange(f"feed:list:{room_id}", 0, -1)
 
-        prev_ts, prev_json, prev_len = cached if (cached and len(cached) >= 3) else (0.0, "[]", 0)
+        if new_items or prev_len > 0:
+            merged_json = _append_items(prev_json, new_items)
+            new_len = prev_len + len(new_items)
+            _feed_cache[room_id] = (time.time(), merged_json, new_len)
+            return merged_json
 
-        try:
-            # Fetch only new items since last cache update
-            new_items = await _rw_async.lrange(f"feed:list:{room_id}", prev_len, -1)
-
-            # Detect if Redis was flushed/cleared externally between test runs
-            if not new_items and prev_len > 0:
-                current_len = await _rw_async.llen(f"feed:list:{room_id}")
-                if current_len < prev_len:
-                    prev_len = 0
-                    prev_json = "[]"
-                    new_items = await _rw_async.lrange(f"feed:list:{room_id}", 0, -1)
-
-            if new_items or prev_len > 0:
-                merged_json = _append_items(prev_json, new_items)
-                new_len = prev_len + len(new_items)
-                _feed_cache[room_id] = (time.time(), merged_json, new_len)
-                return merged_json
-
-        except Exception:
-            if cached:
-                return cached[1]
-            raise
-
-        # Fallback / backfill: handles messages written by the sync version or
-        # pre-existing data that lacks feed:list entries.
+        # feed:list is empty — try backfill from the sorted-set index.
         ids = await _rw_async.zrange(f"feed:room:{room_id}", 0, -1)
         if not ids:
             empty = "[]"
@@ -711,12 +693,47 @@ async def get_feed_json_async(room_id: str = "loadtest") -> str:
                     pipe_backfill.rpush(f"feed:list:{room_id}", item)
                 await pipe_backfill.execute()
             except Exception:
-                pass  # backfill is best-effort; don't let it break the read
+                pass  # backfill is best-effort
 
         body = b"[" + b",".join(items) + b"]"
         json_str = body.decode("utf-8")
         _feed_cache[room_id] = (time.time(), json_str, len(items))
         return json_str
+
+    except Exception as exc:
+        # Redis error: serve stale cache rather than propagating to all awaiters.
+        print(f"[feed] _refresh_feed error for room {room_id!r}: {exc}")
+        if cached:
+            return cached[1]
+        return "[]"
+
+
+async def get_feed_json_async(room_id: str = "loadtest") -> str:
+    """
+    Async version of get_feed_json for the /feed load-test endpoint.
+
+    Uses incremental delta caching + singleflight via asyncio.Task:
+      - Warm cache (< 250ms): returns cached string immediately (0 Redis I/O).
+      - Cache miss: creates ONE Task per room to do the LRANGE+merge.
+      - All concurrent coroutines await the *same* Task object;
+        asyncio wakes them ALL simultaneously on completion — no FIFO
+        lock convoy, no per-waiter task-switch serialisation.
+      - If the inflight Task already completed (done()), a new Task is
+        created for the next cache window.
+    """
+    now = time.time()
+    cached = _feed_cache.get(room_id)
+    if cached and (now - cached[0] < _CACHE_TTL_SEC):
+        return cached[1]  # fast path: warm cache, no I/O
+
+    # No await between the get() and the create_task() call, so this is
+    # atomic on the single-threaded asyncio event loop — no race condition.
+    task = _feed_inflight.get(room_id)
+    if task is None or task.done():
+        task = asyncio.create_task(_refresh_feed(room_id))
+        _feed_inflight[room_id] = task
+
+    return await task
 
 
 # ── User key registry ─────────────────────────────────────────────────────────
