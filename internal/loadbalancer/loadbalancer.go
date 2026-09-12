@@ -822,8 +822,8 @@ func RunCLI(arguments []string, standardOutput io.Writer, standardError io.Write
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", configuration.port),
 		Handler:           balancer.handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       2 * time.Second,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       30 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
