@@ -136,6 +136,6 @@ func (s HealthState) IsRoutable() bool {
 }
 
 const (
-	failsToUnhealthy = 3 // consecutive failures before marking UNHEALTHY
-	successesToOK    = 3 // consecutive successes before RECOVERING → HEALTHY
+	failsToUnhealthy = 10 // consecutive failures before marking UNHEALTHY (raised from 3 — too aggressive under load)
+	successesToOK    = 5  // consecutive successes before RECOVERING → HEALTHY
 )

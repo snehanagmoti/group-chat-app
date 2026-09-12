@@ -247,9 +247,12 @@ FRONTEND_PORT = int(os.environ.get("FRONTEND_PORT", 3000))
 CLEANUP_TIMEOUT = int(os.environ.get("CLEANUP_TIMEOUT", 300))
 
 # ── Metrics for /internal/health (psutil + EWMA latency) ──────────────────────
+# NOTE: We intentionally do NOT use threading.Lock() here.
+# CPython's GIL makes simple int += / -= atomic for our purposes, and using a
+# blocking threading.Lock() inside an async middleware stalls the event loop
+# under high concurrency, causing cascading latency spikes and health failures.
 
 _active_requests: int = 0
-_active_lock = threading.Lock()
 _latency_ewma: float = 0.0
 _EWMA_ALPHA: float = 0.2
 
@@ -261,14 +264,12 @@ async def track_requests_middleware(request, call_next):
     # Skip tracking for the health endpoints themselves to avoid noise
     if request.url.path in ("/health", "/internal/health"):
         return await call_next(request)
-    with _active_lock:
-        _active_requests += 1
+    _active_requests += 1          # GIL-safe atomic on CPython; no lock needed
     t0 = time.perf_counter()
     response = await call_next(request)
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    with _active_lock:
-        _active_requests -= 1
-        _latency_ewma = _EWMA_ALPHA * elapsed_ms + (1 - _EWMA_ALPHA) * _latency_ewma
+    _active_requests -= 1
+    _latency_ewma = _EWMA_ALPHA * elapsed_ms + (1 - _EWMA_ALPHA) * _latency_ewma
     return response
 
 from fastapi.responses import FileResponse
@@ -635,7 +636,9 @@ async def post_message(request: Request):
         msg_id=msg_id,
     )
 
-    print(f"[/message] '{client_name}': {msg_text[:60]!r} | id={saved_msg_id}")
+    # NOTE: print() is intentionally removed from this hot path.
+    # Under high concurrency, print() acquires the GIL + does blocking stdout I/O,
+    # stalling the asyncio event loop and causing cascading latency/health failures.
     return {
         "ok":         True,
         "msg_id":     saved_msg_id,
