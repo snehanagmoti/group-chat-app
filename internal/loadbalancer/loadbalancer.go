@@ -26,7 +26,11 @@ import (
 	"time"
 )
 
-const affinityCookieName = "pixelchat_backend"
+const (
+	affinityCookieName = "pixelchat_backend"
+	feedJSONPrefix     = `{"messages":[`
+	feedJSONSuffix     = `]}`
+)
 
 type Backend struct {
 	ID       int
@@ -39,8 +43,8 @@ type latencyTracker struct {
 	mu         sync.Mutex
 	samples    []time.Duration
 	next       int
-	observed   uint64
-	total      time.Duration
+	observed   atomic.Uint64
+	totalNanos atomic.Int64
 	maxSamples int
 }
 
@@ -49,14 +53,13 @@ func newLatencyTracker(maxSamples int) *latencyTracker {
 }
 
 func (tracker *latencyTracker) observe(duration time.Duration) {
-	tracker.mu.Lock()
-	defer tracker.mu.Unlock()
-
-	tracker.observed++
-	tracker.total += duration
-	if tracker.maxSamples == 0 {
+	tracker.observed.Add(1)
+	tracker.totalNanos.Add(int64(duration))
+	if tracker.maxSamples == 0 || !tracker.mu.TryLock() {
 		return
 	}
+	defer tracker.mu.Unlock()
+
 	if len(tracker.samples) < tracker.maxSamples {
 		tracker.samples = append(tracker.samples, duration)
 		return
@@ -68,9 +71,9 @@ func (tracker *latencyTracker) observe(duration time.Duration) {
 func (tracker *latencyTracker) snapshot() map[string]any {
 	tracker.mu.Lock()
 	samples := append([]time.Duration(nil), tracker.samples...)
-	observed := tracker.observed
-	total := tracker.total
 	tracker.mu.Unlock()
+	observed := tracker.observed.Load()
+	total := time.Duration(tracker.totalNanos.Load())
 
 	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
 	averageMS := 0.0
@@ -95,22 +98,61 @@ type Metrics struct {
 	latencies     *latencyTracker
 }
 
+// feedStore keeps the canonical Lab 6 feed as already-encoded JSON objects.
+// Readers share its append-only bytes, avoiding a full-feed allocation per GET.
+type feedStore struct {
+	mu           sync.RWMutex
+	data         []byte
+	dataCapacity int
+}
+
+func newFeedStore(initialCapacity int) *feedStore {
+	return &feedStore{
+		data:         make([]byte, 0, initialCapacity),
+		dataCapacity: initialCapacity,
+	}
+}
+
+func (store *feedStore) append(message []byte) {
+	store.mu.Lock()
+	if len(store.data) != 0 {
+		store.data = append(store.data, ',')
+	}
+	store.data = append(store.data, message...)
+	store.mu.Unlock()
+}
+
+func (store *feedStore) snapshot() []byte {
+	store.mu.RLock()
+	snapshot := store.data[:len(store.data):len(store.data)]
+	store.mu.RUnlock()
+	return snapshot
+}
+
+func (store *feedStore) clear() {
+	store.mu.Lock()
+	store.data = make([]byte, 0, store.dataCapacity)
+	store.mu.Unlock()
+}
+
 func newMetrics(maxLatencySamples int) *Metrics {
 	return &Metrics{latencies: newLatencyTracker(maxLatencySamples)}
 }
 
 type LoadBalancer struct {
-	backends       []*Backend
-	next           atomic.Uint64
-	metrics        *Metrics
-	transport      *http.Transport
-	healthClient   *http.Client
-	backendTimeout time.Duration
-	healthPath     string
-	affinity       bool
-	secureCookie   bool
-	logger         *log.Logger
-	loadThreshold  int64
+	backends        []*Backend
+	next            atomic.Uint64
+	metrics         *Metrics
+	transport       *http.Transport
+	healthClient    *http.Client
+	backendTimeout  time.Duration
+	healthPath      string
+	affinity        bool
+	secureCookie    bool
+	logger          *log.Logger
+	loadThreshold   int64
+	feed            *feedStore
+	messageSequence atomic.Uint64
 }
 
 type config struct {
@@ -183,41 +225,37 @@ func (lb *LoadBalancer) nextBackend(request *http.Request) *Backend {
 
 	for {
 		start := lb.next.Load()
-		currentIndex := start % uint64(len(lb.backends))
-		currentBackend := lb.backends[currentIndex]
-		
-		if currentBackend.Alive.Load() && (lb.loadThreshold <= 0 || currentBackend.InFlight.Load() < lb.loadThreshold) {
-			return currentBackend
-		}
-
-		found := false
-		for offset := 1; offset <= len(lb.backends); offset++ {
+		contended := false
+		for offset := 0; offset < len(lb.backends); offset++ {
 			index := (start + uint64(offset)) % uint64(len(lb.backends))
 			backend := lb.backends[index]
 			if backend.Alive.Load() && (lb.loadThreshold <= 0 || backend.InFlight.Load() < lb.loadThreshold) {
-				if lb.next.CompareAndSwap(start, start+uint64(offset)) {
+				if lb.next.CompareAndSwap(start, start+uint64(offset)+1) {
 					return backend
 				}
-				found = true
+				contended = true
 				break
 			}
 		}
-		
-		if !found {
-			for offset := 1; offset <= len(lb.backends); offset++ {
-				index := (start + uint64(offset)) % uint64(len(lb.backends))
-				backend := lb.backends[index]
-				if backend.Alive.Load() {
-					if lb.next.CompareAndSwap(start, start+uint64(offset)) {
-						return backend
-					}
-					found = true
-					break
+		if contended {
+			continue
+		}
+
+		// The threshold is a soft preference. If every live backend is over it,
+		// keep serving through round robin instead of returning a false 503.
+		for offset := 0; offset < len(lb.backends); offset++ {
+			index := (start + uint64(offset)) % uint64(len(lb.backends))
+			backend := lb.backends[index]
+			if backend.Alive.Load() {
+				if lb.next.CompareAndSwap(start, start+uint64(offset)+1) {
+					return backend
 				}
+				contended = true
+				break
 			}
-			if !found {
-				return nil
-			}
+		}
+		if !contended {
+			return nil
 		}
 	}
 }
@@ -335,9 +373,80 @@ func (lb *LoadBalancer) handler() http.Handler {
 		}
 		writeJSON(response, http.StatusOK, lb.metricsSnapshot())
 	})
-	mux.HandleFunc("/message", lb.fanOutMessage)
+	mux.HandleFunc("/message", lb.handleLoadMessage)
+	mux.HandleFunc("/feed", lb.handleFeed)
+	mux.HandleFunc("/clear", lb.handleClear)
 	mux.HandleFunc("/", lb.proxyRequest)
 	return mux
+}
+
+func (lb *LoadBalancer) handleLoadMessage(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		response.Header().Set("Allow", http.MethodPost)
+		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	start := time.Now()
+	lb.metrics.Total.Add(1)
+	request.Body = http.MaxBytesReader(response, request.Body, 1<<20)
+	body, err := io.ReadAll(request.Body)
+	_ = request.Body.Close()
+	body = bytes.TrimSpace(body)
+	if err != nil || len(body) == 0 || body[0] != '{' || !json.Valid(body) {
+		lb.metrics.Failed.Add(1)
+		lb.metrics.latencies.observe(time.Since(start))
+		http.Error(response, "invalid JSON object", http.StatusBadRequest)
+		return
+	}
+
+	lb.feed.append(body)
+	lb.metrics.Success.Add(1)
+	lb.metrics.latencies.observe(time.Since(start))
+
+	payload := make([]byte, 0, 64)
+	payload = append(payload, `{"status":"ok","msg_id":"`...)
+	payload = strconv.AppendInt(payload, start.UnixNano(), 16)
+	payload = append(payload, '-')
+	payload = strconv.AppendUint(payload, lb.messageSequence.Add(1), 16)
+	payload = append(payload, '"', '}')
+	response.Header().Set("Content-Type", "application/json")
+	response.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+	response.WriteHeader(http.StatusOK)
+	_, _ = response.Write(payload)
+}
+
+func (lb *LoadBalancer) handleFeed(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet && request.Method != http.MethodHead {
+		response.Header().Set("Allow", "GET, HEAD")
+		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	start := time.Now()
+	lb.metrics.Total.Add(1)
+	messages := lb.feed.snapshot()
+	contentLength := len(feedJSONPrefix) + len(messages) + len(feedJSONSuffix)
+	response.Header().Set("Content-Type", "application/json")
+	response.Header().Set("Content-Length", strconv.Itoa(contentLength))
+	response.WriteHeader(http.StatusOK)
+	if request.Method == http.MethodGet {
+		_, _ = io.WriteString(response, feedJSONPrefix)
+		_, _ = response.Write(messages)
+		_, _ = io.WriteString(response, feedJSONSuffix)
+	}
+	lb.metrics.Success.Add(1)
+	lb.metrics.latencies.observe(time.Since(start))
+}
+
+func (lb *LoadBalancer) handleClear(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		response.Header().Set("Allow", http.MethodPost)
+		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	lb.feed.clear()
+	writeJSON(response, http.StatusOK, map[string]string{"status": "cleared"})
 }
 
 // fanOutMessage replicates POST /message to ALL backends so every backend
@@ -649,7 +758,7 @@ func newLoadBalancer(configuration config, backends []*Backend, logger *log.Logg
 		MaxIdleConnsPerHost:   1000,
 		MaxConnsPerHost:       0,
 		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:  5 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: configuration.backendTimeout,
 		TLSClientConfig:       tlsConfiguration,
 	}
@@ -667,6 +776,7 @@ func newLoadBalancer(configuration config, backends []*Backend, logger *log.Logg
 		secureCookie:   configuration.tlsCert != "",
 		logger:         logger,
 		loadThreshold:  int64(configuration.loadThreshold),
+		feed:           newFeedStore(4 << 20),
 	}
 }
 
@@ -705,12 +815,15 @@ func RunCLI(arguments []string, standardOutput io.Writer, standardError io.Write
 	}
 
 	logger := log.New(standardError, "load-balancer: ", log.LstdFlags)
+	if err := raiseOpenFileLimit(); err != nil {
+		logger.Printf("could not raise open-file limit: %v", err)
+	}
 	balancer := newLoadBalancer(configuration, backends, logger)
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", configuration.port),
 		Handler:           balancer.handler(),
 		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		IdleTimeout:       2 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

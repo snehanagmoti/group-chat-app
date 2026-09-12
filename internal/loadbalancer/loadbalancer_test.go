@@ -2,7 +2,9 @@ package loadbalancer
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -11,10 +13,136 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestLab6FeedKeepsEveryRepeatedSubmission(t *testing.T) {
+	balancer := testBalancer(t, "http://one.test", nil)
+	server := httptest.NewServer(balancer.handler())
+	defer server.Close()
+
+	const requestCount = 200
+	body := []byte(`{"client-name":"load-user","msg":"same-message"}`)
+	errors := make(chan error, requestCount)
+	var waitGroup sync.WaitGroup
+	for range requestCount {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			response, err := http.Post(server.URL+"/message", "application/json", bytes.NewReader(body))
+			if err != nil {
+				errors <- err
+				return
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				errors <- fmt.Errorf("POST status = %d", response.StatusCode)
+			}
+		}()
+	}
+	waitGroup.Wait()
+	close(errors)
+	for err := range errors {
+		t.Error(err)
+	}
+	if t.Failed() {
+		return
+	}
+
+	response, err := http.Get(server.URL + "/feed")
+	if err != nil {
+		t.Fatalf("GET /feed: %v", err)
+	}
+	defer response.Body.Close()
+	var feed struct {
+		Messages []map[string]string `json:"messages"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&feed); err != nil {
+		t.Fatalf("decode feed: %v", err)
+	}
+	if len(feed.Messages) != requestCount {
+		t.Fatalf("feed length = %d, want %d", len(feed.Messages), requestCount)
+	}
+	for index, message := range feed.Messages {
+		if message["client-name"] != "load-user" || message["msg"] != "same-message" {
+			t.Fatalf("message %d changed: %#v", index, message)
+		}
+	}
+}
+
+func TestLab6ClearAndValidation(t *testing.T) {
+	balancer := testBalancer(t, "http://one.test", nil)
+	server := httptest.NewServer(balancer.handler())
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/message", "application/json", strings.NewReader(`[]`))
+	if err != nil {
+		t.Fatalf("invalid POST: %v", err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid POST status = %d, want 400", response.StatusCode)
+	}
+
+	response, err = http.Post(server.URL+"/message", "application/json", strings.NewReader(`{"msg":"kept"}`))
+	if err != nil {
+		t.Fatalf("valid POST: %v", err)
+	}
+	_ = response.Body.Close()
+
+	response, err = http.Post(server.URL+"/clear", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /clear: %v", err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("clear status = %d, want 200", response.StatusCode)
+	}
+
+	response, err = http.Get(server.URL + "/feed")
+	if err != nil {
+		t.Fatalf("GET /feed: %v", err)
+	}
+	defer response.Body.Close()
+	feedBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read feed: %v", err)
+	}
+	if string(feedBody) != `{"messages":[]}` {
+		t.Fatalf("feed after clear = %q", feedBody)
+	}
+}
+
+func TestLab6FeedAlwaysReturnsPlainJSON(t *testing.T) {
+	balancer := testBalancer(t, "http://one.test", nil)
+	server := httptest.NewServer(balancer.handler())
+	defer server.Close()
+
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/feed", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Accept-Encoding", "gzip")
+	client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatalf("GET /feed: %v", err)
+	}
+	defer response.Body.Close()
+	if encoding := response.Header.Get("Content-Encoding"); encoding != "" {
+		t.Fatalf("Content-Encoding = %q, want plain JSON", encoding)
+	}
+	feedBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read feed: %v", err)
+	}
+	if string(feedBody) != `{"messages":[]}` {
+		t.Fatalf("feed = %q", feedBody)
+	}
+}
 
 func testConfig() config {
 	return config{
