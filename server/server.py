@@ -288,9 +288,8 @@ async def internal_health():
     Rich health metrics polled every 1s by the LB scoring engine.
     Returns CPU%, memory%, active in-flight requests, and EWMA latency.
     """
-    with _active_lock:
-        active = _active_requests
-        latency = _latency_ewma
+    active = _active_requests   # GIL-safe read; no lock needed
+    latency = _latency_ewma
     return {
         "status":          "healthy",
         "cpu":             psutil.cpu_percent(interval=None),
