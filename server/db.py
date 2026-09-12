@@ -446,6 +446,16 @@ def edit_message(
 
 _feed_cache: dict[str, tuple[float, str]] = {}
 _CACHE_TTL_SEC = 0.25  # 250ms micro-cache coalesces high-concurrency read spikes
+# Per-room lock used to single-flight cache misses in get_feed_json_async.
+# Without this, when the cache entry expires every concurrent /feed coroutine
+# that arrives in that sub-250ms window independently fires its own full
+# LRANGE 0 -1. At 500+ concurrent users, dozens of coroutines can miss
+# simultaneously — Valkey must allocate a reply buffer for each one in
+# parallel, which can spike its RSS well above maxmemory (output buffers are
+# not counted against maxmemory) and trigger an OOM kill.
+# With the lock, only one coroutine runs the LRANGE; every other waiter
+# re-checks the cache after acquiring and returns the already-populated entry.
+_feed_lock: dict[str, asyncio.Lock] = {}
 
 def save_message_simple(msg_id: str, room_id: str, username: str, text: str) -> bool:
     """
@@ -608,62 +618,75 @@ async def get_feed_json_async(room_id: str = "loadtest") -> str:
     """
     Async version of get_feed_json for the /feed load-test endpoint.
 
-    Shares _feed_cache with the sync version: a 250ms micro-cache that
-    absorbs concurrent reader bursts (multiple coroutines hitting /feed at
-    the same instant all get the cached string instead of all racing to
-    LRANGE Redis simultaneously).
+    Uses a per-room asyncio.Lock to single-flight cache misses:
+      - If the cache is warm, return immediately (no lock taken).
+      - On a miss, exactly ONE coroutine fetches from Redis; all concurrent
+        waiters re-check the cache on lock acquisition and return the result
+        the winner already populated, never touching Redis themselves.
+
+    This collapses N simultaneous LRANGE calls (one per concurrent /feed
+    request when the 250ms cache turns over) into a single one, preventing
+    the reply-buffer memory spike that was OOM-killing Valkey.
     """
     now = time.time()
     cached = _feed_cache.get(room_id)
     if cached and (now - cached[0] < _CACHE_TTL_SEC):
-        return cached[1]
+        return cached[1]  # fast path: no lock needed
 
-    # Fast path: single LRANGE fetches pre-serialised JSON blobs stored by
-    # save_message_simple_async. Joins them into a valid JSON array without
-    # any Python-side JSON parsing or serialisation.
-    raw_list = await _rw_async.lrange(f"feed:list:{room_id}", 0, -1)
-    if raw_list:
-        body = b"[" + b",".join(raw_list) + b"]"
+    # Slow path: cache miss. Acquire the per-room lock so only one coroutine
+    # runs the LRANGE; everyone else waits and hits the re-check below.
+    lock = _feed_lock.setdefault(room_id, asyncio.Lock())
+    async with lock:
+        # Double-check: another coroutine may have refreshed the cache while
+        # we were waiting for the lock.
+        cached = _feed_cache.get(room_id)
+        if cached and (time.time() - cached[0] < _CACHE_TTL_SEC):
+            return cached[1]
+
+        # We hold the lock and the cache is still stale — we're the one fetch.
+        raw_list = await _rw_async.lrange(f"feed:list:{room_id}", 0, -1)
+        if raw_list:
+            body = b"[" + b",".join(raw_list) + b"]"
+            json_str = body.decode("utf-8")
+            _feed_cache[room_id] = (time.time(), json_str)
+            return json_str
+
+        # Fallback / backfill: handles messages written by the sync version or
+        # pre-existing data that lacks feed:list entries.
+        ids = await _rw_async.zrange(f"feed:room:{room_id}", 0, -1)
+        if not ids:
+            empty = "[]"
+            _feed_cache[room_id] = (time.time(), empty)
+            return empty
+
+        pipe = _rw_async.pipeline(transaction=False)
+        for mid in ids:
+            pipe.hgetall(f"msg:{mid.decode()}")
+        rows = await pipe.execute()
+
+        items = []
+        pipe_backfill = _rw_async.pipeline(transaction=False)
+        for mid, fields in zip(ids, rows):
+            if not fields:
+                continue
+            f = {k.decode(): v.decode() for k, v in fields.items()}
+            jstr = f.get("json") or json.dumps({
+                "msg_id":      mid.decode(),
+                "client-name": f.get("username", ""),
+                "msg":         f.get("text", ""),
+                "timestamp":   f.get("timestamp", ""),
+            })
+            items.append(jstr.encode("utf-8") if isinstance(jstr, str) else jstr)
+            pipe_backfill.rpush(f"feed:list:{room_id}", jstr)
+        try:
+            await pipe_backfill.execute()
+        except Exception:
+            pass  # backfill is best-effort; don't let it break the read
+
+        body = b"[" + b",".join(items) + b"]"
         json_str = body.decode("utf-8")
-        _feed_cache[room_id] = (now, json_str)
+        _feed_cache[room_id] = (time.time(), json_str)
         return json_str
-
-    # Fallback / backfill: handles messages written by the sync version or
-    # pre-existing data that lacks feed:list entries.
-    ids = await _rw_async.zrange(f"feed:room:{room_id}", 0, -1)
-    if not ids:
-        empty = "[]"
-        _feed_cache[room_id] = (now, empty)
-        return empty
-
-    pipe = _rw_async.pipeline(transaction=False)
-    for mid in ids:
-        pipe.hgetall(f"msg:{mid.decode()}")
-    rows = await pipe.execute()
-
-    items = []
-    pipe_backfill = _rw_async.pipeline(transaction=False)
-    for mid, fields in zip(ids, rows):
-        if not fields:
-            continue
-        f = {k.decode(): v.decode() for k, v in fields.items()}
-        jstr = f.get("json") or json.dumps({
-            "msg_id":      mid.decode(),
-            "client-name": f.get("username", ""),
-            "msg":         f.get("text", ""),
-            "timestamp":   f.get("timestamp", ""),
-        })
-        items.append(jstr.encode("utf-8") if isinstance(jstr, str) else jstr)
-        pipe_backfill.rpush(f"feed:list:{room_id}", jstr)
-    try:
-        await pipe_backfill.execute()
-    except Exception:
-        pass  # backfill is best-effort; don't let it break the read
-
-    body = b"[" + b",".join(items) + b"]"
-    json_str = body.decode("utf-8")
-    _feed_cache[room_id] = (now, json_str)
-    return json_str
 
 
 # ── User key registry ─────────────────────────────────────────────────────────
