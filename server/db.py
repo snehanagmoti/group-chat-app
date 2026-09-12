@@ -16,6 +16,7 @@ Handles:
   - Session token store (Valkey-backed, cross-server, TTL-guarded)
 """
 
+import asyncio
 import hmac
 import hashlib
 import os
@@ -635,7 +636,11 @@ async def get_feed_json_async(room_id: str = "loadtest") -> str:
 
     # Slow path: cache miss. Acquire the per-room lock so only one coroutine
     # runs the LRANGE; everyone else waits and hits the re-check below.
-    lock = _feed_lock.setdefault(room_id, asyncio.Lock())
+    lock = _feed_lock.get(room_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _feed_lock[room_id] = lock
+
     async with lock:
         # Double-check: another coroutine may have refreshed the cache while
         # we were waiting for the lock.
@@ -644,12 +649,17 @@ async def get_feed_json_async(room_id: str = "loadtest") -> str:
             return cached[1]
 
         # We hold the lock and the cache is still stale — we're the one fetch.
-        raw_list = await _rw_async.lrange(f"feed:list:{room_id}", 0, -1)
-        if raw_list:
-            body = b"[" + b",".join(raw_list) + b"]"
-            json_str = body.decode("utf-8")
-            _feed_cache[room_id] = (time.time(), json_str)
-            return json_str
+        try:
+            raw_list = await _rw_async.lrange(f"feed:list:{room_id}", 0, -1)
+            if raw_list:
+                body = b"[" + b",".join(raw_list) + b"]"
+                json_str = body.decode("utf-8")
+                _feed_cache[room_id] = (time.time(), json_str)
+                return json_str
+        except Exception:
+            if cached:
+                return cached[1]
+            raise
 
         # Fallback / backfill: handles messages written by the sync version or
         # pre-existing data that lacks feed:list entries.
