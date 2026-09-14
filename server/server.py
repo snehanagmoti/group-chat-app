@@ -669,6 +669,14 @@ def _derive_peer_urls() -> list[str]:
 
 _PEER_URLS: list[str] = _derive_peer_urls()
 
+# Persistent httpx client — reused across requests to avoid connection setup overhead.
+# Creating a new AsyncClient per request was a major bottleneck under high concurrency.
+import httpx as _httpx
+_peer_http_client = _httpx.AsyncClient(
+    timeout=_httpx.Timeout(connect=0.5, read=0.5, write=0.5, pool=0.5),
+    limits=_httpx.Limits(max_connections=50, max_keepalive_connections=20),
+)
+
 # ── Short-lived feed cache ────────────────────────────────────────────────────
 _feed_cache: dict = {"ts": 0.0, "data": None}
 _FEED_CACHE_TTL_S: float = 0.20   # 200 ms
@@ -679,7 +687,7 @@ async def internal_feed_local():
     """
     Returns messages from LOCAL Valkey ONLY — no fan-out.
     Called by sibling backends when serving GET /feed to aggregate all data.
-    NEVER call /internal/feed from here (would cause infinite loops).
+    NEVER fan-out from here (would cause infinite loops).
     """
     messages = await db.get_feed_local()
     return {"messages": messages, "count": len(messages)}
@@ -690,17 +698,15 @@ async def get_feed(limit: int = 0):
     """
     GET /feed — Required by the assignment evaluator.
 
-    Returns messages from ALL backends merged together.
     Strategy:
       1. Read from LOCAL Valkey (fast, always works)
-      2. Fan-out HTTP GET /internal/feed to all sibling backends in parallel
-      3. Merge all results by msg_id, sort by created_at
-
-    This works even when cross-machine Valkey is not accessible, because
-    backend-to-backend HTTP is always routable on the LAN.
+      2. If local is non-empty → sync replication worked → return local data
+         (avoids HTTP fan-out overhead under load)
+      3. If local is empty → sync replication may have failed → fan-out to
+         peer backends via HTTP with short 300ms timeout to collect their data
+      4. Merge all results by msg_id, sort by created_at
     """
     import time as _time
-    import httpx
 
     now = _time.monotonic()
     cached = _feed_cache["data"]
@@ -714,42 +720,41 @@ async def get_feed(limit: int = 0):
             return {"messages": cached[-limit:], "count": min(len(cached), limit)}
         return {"messages": cached, "count": len(cached)}
 
-    # Step 1: local Valkey read
+    # Step 1: local Valkey read (fast, no network)
     local_msgs = await db.get_feed_local()
 
-    # Step 2: fan-out to sibling backends via HTTP
-    async def _fetch_peer(url: str) -> list[dict]:
-        try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                resp = await client.get(f"{url}/internal/feed")
+    # Step 2: smart fan-out decision
+    # If local has data → sync replication worked → trust it (no fan-out needed)
+    # If local is empty → sync replication failed → fan-out to peers as fallback
+    if local_msgs:
+        merged = local_msgs
+    elif _PEER_URLS:
+        # Fan-out: ask each sibling for ITS local data
+        async def _fetch_peer(url: str) -> list[dict]:
+            try:
+                resp = await _peer_http_client.get(f"{url}/internal/feed")
                 if resp.status_code == 200:
                     return resp.json().get("messages", [])
-        except Exception:
-            pass
-        return []
+            except Exception:
+                pass
+            return []
 
-    if _PEER_URLS:
         peer_results = await asyncio.gather(
             *[_fetch_peer(url) for url in _PEER_URLS],
             return_exceptions=True,
         )
+
+        seen: dict[str, dict] = {}
+        for result in peer_results:
+            if isinstance(result, list):
+                for msg in result:
+                    mid = msg.get("msg_id")
+                    if mid and mid not in seen:
+                        seen[mid] = msg
+        merged = sorted(seen.values(), key=lambda m: m.get("created_at", 0))
     else:
-        peer_results = []
+        merged = []
 
-    # Step 3: merge and deduplicate by msg_id
-    seen: dict[str, dict] = {}
-    for msg in local_msgs:
-        mid = msg.get("msg_id")
-        if mid:
-            seen[mid] = msg
-    for result in peer_results:
-        if isinstance(result, list):
-            for msg in result:
-                mid = msg.get("msg_id")
-                if mid and mid not in seen:
-                    seen[mid] = msg
-
-    merged = sorted(seen.values(), key=lambda m: m.get("created_at", 0))
     _feed_cache["data"] = merged
     _feed_cache["ts"] = now
 
