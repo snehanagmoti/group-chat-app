@@ -1,0 +1,2 @@
+Experiment,Requests,Concurrency,Success,Failed,RPS,DropoutPercent,p50_ms,p95_ms,p99_ms,avg_ms,ElapsedSec
+Human_Jitter,2000,30,2000,0,141.30,0.00%,172.77ms,280.79ms,318.33ms,178.63ms,14.155

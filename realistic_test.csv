@@ -1,0 +1,2 @@
+Experiment,Requests,Concurrency,Success,Failed,RPS,DropoutPercent,p50_ms,p95_ms,p99_ms,avg_ms,ElapsedSec
+Realistic_Workload,2000,40,1471,529,69.30,26.45%,417.75ms,822.47ms,901.62ms,392.14ms,21.227

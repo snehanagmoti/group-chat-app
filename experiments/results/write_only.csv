@@ -1,0 +1,2 @@
+Experiment,Requests,Concurrency,Success,Failed,RPS,DropoutPercent,p50_ms,p95_ms,p99_ms,avg_ms,ElapsedSec
+Write_Only_100,3000,40,3000,0,228.84,0.00%,158.22ms,285.15ms,405.59ms,174.14ms,13.110

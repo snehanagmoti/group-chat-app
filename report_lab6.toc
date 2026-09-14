@@ -1,0 +1,32 @@
+\contentsline {section}{\numberline {1}Introduction and System Overview}{2}{section.1}%
+\contentsline {subsection}{\numberline {1.1}4-Machine Deployment Architecture}{2}{subsection.1.1}%
+\contentsline {section}{\numberline {2}Performance-Based Dynamic Load Balancing}{2}{section.2}%
+\contentsline {subsection}{\numberline {2.1}Algorithm Design}{2}{subsection.2.1}%
+\contentsline {subsubsection}{\numberline {2.1.1}Composite Score Formula}{2}{subsubsection.2.1.1}%
+\contentsline {subsubsection}{\numberline {2.1.2}Exponential Weighted Moving Average (EWMA)}{3}{subsubsection.2.1.2}%
+\contentsline {subsection}{\numberline {2.2}Overload Detection and Traffic Switching}{3}{subsection.2.2}%
+\contentsline {subsection}{\numberline {2.3}Health Checks and Unhealthy Backend Removal}{3}{subsection.2.3}%
+\contentsline {subsection}{\numberline {2.4}Threshold Optimization}{3}{subsection.2.4}%
+\contentsline {section}{\numberline {3}Database Persistence and Duplicate Prevention}{4}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Storage Schema}{4}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Idempotent Writes and Duplicate Prevention}{4}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Fire-and-Forget Replication}{4}{subsection.3.3}%
+\contentsline {section}{\numberline {4}Required API Routes}{5}{section.4}%
+\contentsline {section}{\numberline {5}Custom Load Generator}{5}{section.5}%
+\contentsline {section}{\numberline {6}Experimental Results}{5}{section.6}%
+\contentsline {subsection}{\numberline {6.1}Summary Table}{6}{subsection.6.1}%
+\contentsline {subsection}{\numberline {6.2}Plots}{6}{subsection.6.2}%
+\contentsline {subsubsection}{\numberline {6.2.1}Figure 1: Response Time Distribution by Workload}{6}{subsubsection.6.2.1}%
+\contentsline {subsubsection}{\numberline {6.2.2}Figure 2: Throughput (Requests per Second)}{7}{subsubsection.6.2.2}%
+\contentsline {subsubsection}{\numberline {6.2.3}Figure 3: Latency Profile Across Workloads}{7}{subsubsection.6.2.3}%
+\contentsline {subsubsection}{\numberline {6.2.4}Figure 4: Request Outcomes --- Success vs.\ Dropout}{8}{subsubsection.6.2.4}%
+\contentsline {subsubsection}{\numberline {6.2.5}Figure 5: System Utilization of All 4 Systems}{9}{subsubsection.6.2.5}%
+\contentsline {subsubsection}{\numberline {6.2.6}Figure 6: Per-System Load Breakdown (Sys1--Sys4)}{9}{subsubsection.6.2.6}%
+\contentsline {subsubsection}{\numberline {6.2.7}Figure 7: Elapsed Wall-Clock Time}{10}{subsubsection.6.2.7}%
+\contentsline {section}{\numberline {7}Analysis and Discussion}{10}{section.7}%
+\contentsline {subsection}{\numberline {7.1}Why Write-Only Outperforms Read-Only}{10}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}Load Balancer Effectiveness}{10}{subsection.7.2}%
+\contentsline {subsection}{\numberline {7.3}Vigorous Stress Test Analysis}{10}{subsection.7.3}%
+\contentsline {section}{\numberline {8}Application Integrity --- No Functionality Removed}{11}{section.8}%
+\contentsline {section}{\numberline {9}Repository and Submission}{12}{section.9}%
+\contentsline {section}{\numberline {10}Conclusion}{12}{section.10}%

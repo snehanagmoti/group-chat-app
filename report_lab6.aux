@@ -1,0 +1,59 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction and System Overview}{2}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.1}4-Machine Deployment Architecture}{2}{subsection.1.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Deployment mapping across the four allocated systems}}{2}{table.caption.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Performance-Based Dynamic Load Balancing}{2}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Algorithm Design}{2}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {2.1.1}Composite Score Formula}{2}{subsubsection.2.1.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Composite scoring weights (experimentally validated)}}{3}{table.caption.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {2.1.2}Exponential Weighted Moving Average (EWMA)}{3}{subsubsection.2.1.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Overload Detection and Traffic Switching}{3}{subsection.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Health Checks and Unhealthy Backend Removal}{3}{subsection.2.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.4}Threshold Optimization}{3}{subsection.2.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Database Persistence and Duplicate Prevention}{4}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Storage Schema}{4}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Idempotent Writes and Duplicate Prevention}{4}{subsection.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Fire-and-Forget Replication}{4}{subsection.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Required API Routes}{5}{section.4}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Required API routes exposed through the Load Balancer}}{5}{table.caption.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Custom Load Generator}{5}{section.5}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Load generator command-line parameters}}{5}{table.caption.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Experimental Results}{5}{section.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Summary Table}{6}{subsection.6.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Load generator experiment results summary}}{6}{table.caption.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Plots}{6}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {6.2.1}Figure 1: Response Time Distribution by Workload}{6}{subsubsection.6.2.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Latency percentiles grouped by workload type. Write-Only has the lowest $p_{50}$ (158\,ms) due to fire-and-forget replication. Vigorous Stress shows the highest $p_{99}$ (1540\,ms) at 150 concurrent workers.}}{6}{figure.caption.7}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{fig:latency}{{1}{6}{Latency percentiles grouped by workload type. Write-Only has the lowest $p_{50}$ (158\,ms) due to fire-and-forget replication. Vigorous Stress shows the highest $p_{99}$ (1540\,ms) at 150 concurrent workers}{figure.caption.7}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {6.2.2}Figure 2: Throughput (Requests per Second)}{7}{subsubsection.6.2.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Throughput (RPS) per experiment. Write-Only achieves the highest RPS (228.8) because each POST only awaits a single local Valkey write. Vigorous Stress achieves 194 RPS at 150 workers --- high throughput sustained by the LB's dynamic redistribution.}}{7}{figure.caption.8}\protected@file@percent }
+\newlabel{fig:rps}{{2}{7}{Throughput (RPS) per experiment. Write-Only achieves the highest RPS (228.8) because each POST only awaits a single local Valkey write. Vigorous Stress achieves 194 RPS at 150 workers --- high throughput sustained by the LB's dynamic redistribution}{figure.caption.8}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {6.2.3}Figure 3: Latency Profile Across Workloads}{7}{subsubsection.6.2.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Latency profile (line chart). Vigorous Stress causes a dramatic spike in all four metrics. The widening gap between $p_{50}$ and $p_{99}$ under stress indicates queuing delay as the overload threshold is hit.}}{7}{figure.caption.9}\protected@file@percent }
+\newlabel{fig:latdist}{{3}{7}{Latency profile (line chart). Vigorous Stress causes a dramatic spike in all four metrics. The widening gap between $p_{50}$ and $p_{99}$ under stress indicates queuing delay as the overload threshold is hit}{figure.caption.9}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {6.2.4}Figure 4: Request Outcomes --- Success vs.\ Dropout}{8}{subsubsection.6.2.4}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Request outcomes. All five baseline workloads achieved 0.00\% dropout. The Vigorous Stress test (10000 requests, 150 workers) produced a single failed request (0.01\%), demonstrating system stability under extreme load.}}{8}{figure.caption.10}\protected@file@percent }
+\newlabel{fig:outcomes}{{4}{8}{Request outcomes. All five baseline workloads achieved 0.00\% dropout. The Vigorous Stress test (10000 requests, 150 workers) produced a single failed request (0.01\%), demonstrating system stability under extreme load}{figure.caption.10}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {6.2.5}Figure 5: System Utilization of All 4 Systems}{9}{subsubsection.6.2.5}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Estimated system utilization relative to peak throughput (228.8 RPS). Sys1 (LB) runs at $\approx $65\% of backend load since it only routes. Backend experiments stay near or below the 70\% overload threshold. Vigorous Stress drives backends to $\approx $85\%, triggering the dynamic threshold mechanism.}}{9}{figure.caption.11}\protected@file@percent }
+\newlabel{fig:util}{{5}{9}{Estimated system utilization relative to peak throughput (228.8 RPS). Sys1 (LB) runs at $\approx $65\% of backend load since it only routes. Backend experiments stay near or below the 70\% overload threshold. Vigorous Stress drives backends to $\approx $85\%, triggering the dynamic threshold mechanism}{figure.caption.11}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {6.2.6}Figure 6: Per-System Load Breakdown (Sys1--Sys4)}{9}{subsubsection.6.2.6}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces Per-system load panel for all four machines. Sys1 sees all traffic. Each of Sys2, Sys3, Sys4 handles $\approx $1/3 of total RPS confirming even load distribution. WO=Write-Only, WH=Write-Heavy, 50/50=Balanced, RH=Read-Heavy, RO=Read-Only, VS=Vigorous Stress.}}{9}{figure.caption.12}\protected@file@percent }
+\newlabel{fig:persys}{{6}{9}{Per-system load panel for all four machines. Sys1 sees all traffic. Each of Sys2, Sys3, Sys4 handles $\approx $1/3 of total RPS confirming even load distribution. WO=Write-Only, WH=Write-Heavy, 50/50=Balanced, RH=Read-Heavy, RO=Read-Only, VS=Vigorous Stress}{figure.caption.12}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {6.2.7}Figure 7: Elapsed Wall-Clock Time}{10}{subsubsection.6.2.7}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {7}{\ignorespaces Wall-clock time per experiment (3000 requests / 40 workers except Vigorous Stress at 10000 / 150). Write-Only completes in 13.1\,s vs.\ 29.6\,s for Read-Only --- a $2.3\times $ difference due to JSON serialization cost of 200-message payloads.}}{10}{figure.caption.13}\protected@file@percent }
+\newlabel{fig:elapsed}{{7}{10}{Wall-clock time per experiment (3000 requests / 40 workers except Vigorous Stress at 10000 / 150). Write-Only completes in 13.1\,s vs.\ 29.6\,s for Read-Only --- a $2.3\times $ difference due to JSON serialization cost of 200-message payloads}{figure.caption.13}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Analysis and Discussion}{10}{section.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Why Write-Only Outperforms Read-Only}{10}{subsection.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Load Balancer Effectiveness}{10}{subsection.7.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Vigorous Stress Test Analysis}{10}{subsection.7.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Application Integrity --- No Functionality Removed}{11}{section.8}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces Preserved features from previous lab implementations}}{11}{table.caption.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}Repository and Submission}{12}{section.9}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {7}{\ignorespaces Code organization}}{12}{table.caption.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}Conclusion}{12}{section.10}\protected@file@percent }
+\gdef \@abspage@last{13}

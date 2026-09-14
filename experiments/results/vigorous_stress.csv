@@ -1,0 +1,4 @@
+Experiment,Requests,Concurrency,Success,Failed,RPS,DropoutPercent,p50_ms,p95_ms,p99_ms,avg_ms,ElapsedSec
+Vigorous_Stress_Test,10000,150,9999,1,194.14,0.01%,799.07ms,1261.54ms,1539.98ms,733.30ms,51.504
+Vigorous_Stress_Test,10000,150,134,9866,8.94,98.66%,18.27ms,1942.58ms,5000.05ms,213.39ms,14.983
+Vigorous_Stress_Test,10000,150,5746,4254,61.23,42.54%,977.41ms,3112.24ms,5000.12ms,1182.93ms,93.842
