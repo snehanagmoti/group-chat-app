@@ -1,7 +1,7 @@
-# PixelChat — Secure Group Quest v2.0
+# PixelChat: Secure Group Quest
 
-> **🌐 Load Balancer (primary entry point):** `http://10.1.75.51:4273`
-> **📁 Frontend UI:** [https://10.1.75.51:3269/](https://10.1.75.51:3269/)
+> **🌐 Load Balancer (primary entry point):** `http://10.1.75.51:4273`  
+> **📁 Frontend UI (Optional / Local):** Served via `client/serve.py` (e.g. `https://localhost:3000` locally, or `https://10.1.75.51:3273` if hosted on Sys1)
 
 A **real-time, secure, gamified group chat** built with **FastAPI** (Python backend) and **Vanilla HTML/CSS/JS** (no frameworks), styled with a retro 8-bit pixel aesthetic. All messages are **end-to-end encrypted** using AES-GCM via the browser's Web Crypto API, **digitally signed** with ECDSA-P256, and **persisted encrypted** in a Valkey (Redis-compatible) database with HMAC-SHA256 tamper detection.
 
@@ -13,11 +13,11 @@ The backend is deployed across **three systems** behind a custom **Go load balan
 
 1. [Features](#features)
 2. [Tech Stack](#tech-stack)
-3. [Deployment Architecture](#deployment-architecture)
+3. [Deployment Architecture & Port Mappings](#deployment-architecture--port-mappings)
 4. [Load Balancer (Go)](#load-balancer-go)
-5. [Load Generator](#load-generator)
+5. [Load Generator & Testing Workflows](#load-generator--testing-workflows)
 6. [Security & Encryption](#security--encryption)
-7. [Database Design](#database-design)
+7. [Database Design (Valkey)](#database-design-valkey)
 8. [Gamification System](#gamification-system)
 9. [WebSocket Message Protocol](#websocket-message-protocol)
 10. [REST API Reference](#rest-api-reference)
@@ -32,118 +32,64 @@ The backend is deployed across **three systems** behind a custom **Go load balan
 
 ## Features
 
-### 🔐 Security & Encryption
+### 🎮 Retro Pixel Theme & Gamification
+- **8-Bit Aesthetic** — Dark theme featuring pixelated fonts (Press Start 2P / VT323), vibrant neon accents, scanline overlays, and sound effects.
+- **XP & Leveling** — Earn XP for sending/receiving messages, streak bonuses, room creation, and active presence.
+- **Ranks** — Progress through 6 ranks: `🌱 NEWBIE` → `🗡️ SQUIRE` → `🛡️ KNIGHT` → `🏆 CHAMPION` → `👑 WARLORD` → `⭐ LEGEND`.
+- **Sound Effects** — Audio chimes for message events, user join/leave, and leveling up.
 
-- **AES-GCM 256-bit Encryption** — Every message (text, file, voice) is encrypted in the browser before being sent. The server never sees plaintext.
-- **ECDSA-P256 Digital Signatures** — Each user generates a per-session key pair on login. Every outgoing message is signed with the private key. The server verifies the signature on every incoming message.
-- **HMAC-SHA256 Database Tamper Detection** — Each stored record has an HMAC digest computed over `(ciphertext + iv)`. On history load, all records are re-verified and tampered rows are flagged `🚨 TAMPERED`.
-- **Security Badge Per Message** — Each message bubble displays one of: `🔒✓ VERIFIED`, `⚠ SIG INVALID`, or `🚨 TAMPERED` based on server-side verification.
-- **TLS/HTTPS + WSS** — Both frontend and backend run with self-signed SSL certificates (`cert.pem` / `key.pem`) so the Web Crypto API is available in all browsers (requires HTTPS context).
-- **bcrypt Password Hashing** — User passwords are hashed with bcrypt (salted) before storage. The plaintext password is never stored.
-- **One-Time Session Tokens** — After login or register, the server issues a single-use opaque token (`secrets.token_hex(32)`). The token is consumed when the WebSocket connection is established, preventing replay attacks.
-- **Whisper (Private Message) Privacy** — Private messages sent via `/w @username` are stored in the DB but only returned to the sender and recipient in history queries.
+### 🔒 Security & Privacy
+- **End-to-End Encryption (AES-GCM)** — Messages are encrypted client-side using 256-bit AES-GCM before transmission.
+- **ECDSA-P256 Digital Signatures** — Every outgoing message is signed client-side with the user's private key; the server verifies every signature before persistence or broadcast.
+- **Encrypted at Rest** — Valkey persists only ciphertexts and IVs, never plaintext.
+- **HMAC-SHA256 Tamper Detection** — Message integrity is guarded by keyed HMAC digests re-verified on history retrieval.
+- **Whisper / Direct Messages** — Private encrypted messages sent to a specific user inside a shared room.
+- **Ephemerality** — 5-minute window for message edits; soft-delete support.
 
-### 💬 Messaging Features
-
-- **Real-time WebSocket Broadcasting** — Messages are broadcast instantly to all connected users in a room.
-- **Optimistic UI** — Sender's own message appears immediately without waiting for server echo.
-- **Threaded Replies** — Reply to any specific message with a quoted preview bubble. Stored as `reply_to` (msg_id reference) in the database.
-- **Whispers / Private Messages** — Type `/w @username <message>` to send an end-to-end encrypted private message only visible to the target user.
-- **@Mentions** — Type `@username` in a message to highlight the mentioned user's bubble with a glow effect and play a mention sound effect.
-- **Edit Messages** — Senders can edit their own messages within a 5-minute window. The edit is re-encrypted, re-signed, and broadcast to the room.
-- **Delete / Unsend Messages** — Senders can permanently delete their own messages. A tombstone event is broadcast and the message is soft-deleted in the DB (ciphertext cleared).
-- **Typing Indicator** — Shows "username is typing…" with an animated pixel-dot animation when another user is composing a message. Auto-clears after 2 seconds.
-- **Emoji Picker** — A quick-react panel with 28 common emojis inserted at cursor position.
-- **Voice Memos** — Hold-to-record in-app audio messages using the MediaRecorder API. Recordings are encrypted and sent as file attachments.
-
-### 🏠 Room Management
-
-- **Multi-Room Support** — Unlimited rooms, each identified by a unique 6-character alphanumeric code (e.g., `XKJ3P9`).
-- **Create Public or Private Rooms** — Public rooms appear in the lobby browse list. Private rooms are accessible only via their code.
-- **Room Avatar** — Each room has its own emoji avatar (Castle, Volcano, Arena, Arcade, Tavern, etc.).
-- **Join by Code** — Users can join any room (including private ones) by entering the 6-character code directly.
-- **Room Search** — Live search/filter the public room list in the lobby.
-- **Creator Privileges** — The room creator (👑) can:
-  - 🧹 **Clear History** — Delete all chat messages for the room from the database.
-  - 🗑️ **Delete Room** — Permanently remove the room and all its messages.
-- **Live Online Count** — Each room card shows the current number of online players.
-
-### 👤 User Accounts & Authentication
-
-- **Persistent User Accounts** — Users register with a username, password, and avatar. Accounts persist across sessions.
-- **bcrypt Login / Register** — Passwords are hashed with bcrypt. Server validates against the stored hash.
-- **Avatar Picker** — 12 pre-built pixel avatars: Wizard, Robot, Ninja, Astronaut, Dragon, Hero, Alien, Cyber, Fox, Owl, Bear, Lion.
-- **Username Validation** — 1–20 characters, alphanumeric + underscore only. Case-insensitive uniqueness enforced.
-- **Logout** — Cleanly returns user to login screen without losing the session state.
-- **Token Refresh** — Returning to lobby (after leaving a room) issues a new one-time token without requiring re-login.
-
-### 🎮 Gamification
-
-- **XP System** — Earn XP for all in-app actions (see [Gamification System](#gamification-system)).
-- **6 Rank Tiers** — Newbie → Squire → Knight → Champion → Warlord → Legend.
-- **Message Streak Bonus** — Every 10th consecutive message earns +25 XP bonus.
-- **Passive XP (Heartbeat)** — Earn +5 XP per minute spent in a room.
-- **Level-Up Toast** — Animated retro "★ LEVEL UP! ★" toast popup on rank promotion.
-- **XP Progress Bar** — Visual XP bar displayed in both the lobby header and the chat sidebar.
-- **Floating XP Toasts** — Each XP gain triggers a floating "+10 XP" notification.
-- **XP Persistence** — XP is stored in the database and persists across all sessions and rooms.
-
-### 📎 Media & Files
-
-- **File Attachments** — Attach images, videos, audio, PDFs, ZIP files, and any generic file.
-- **Inline Rendering** — Images render as inline thumbnails; videos and audio play inline in the chat.
-- **Voice Memos** — Record audio directly in-browser; encrypted and sent as `.webm` attachments.
-- **Upload API** — Files are uploaded via `POST /upload` before the message is sent, and the resulting URL is embedded in the encrypted message payload.
-
-### 🔄 Persistence & History
-
-- **Unlimited Message History** — All messages are persisted in the SQLite database and delivered to new joiners on connect.
-- **Encrypted at Rest** — Only the AES-GCM ciphertext is stored, never the plaintext.
-- **HMAC Tamper Detection** — Every message has an HMAC digest that is re-verified when history is loaded.
-- **Soft Delete** — Deleted messages keep their DB row but have ciphertext cleared and `is_deleted=1`.
-- **Edit Tracking** — Edited messages store a new ciphertext and mark `is_edited=1`.
-- **Whisper Filtering** — History queries filter whispers so each user only receives messages they are party to.
-
-### 📡 Connection & UX
-
-- **Connection Status Indicator** — Live `🟢 ONLINE` / `🔴 OFFLINE` / `🟡 RECONNECTING` badge in the header.
-- **Auto-Reconnect with Exponential Backoff** — Disconnections are automatically retried with 1s → 10s delay.
-- **Multi-Tab Support** — Multiple browser tabs with the same account are handled correctly (join/leave events deduplicated; user list shows one entry per unique username).
-- **Delivery Receipts** — Each outgoing message gets a receipt emoji (😴 Sent / 😃 Partial / 😎 Delivered) from the server.
-- **Security Certificate Onboarding Overlay** — If the browser blocks the backend's self-signed cert, a friendly overlay guides the user through accepting it without leaving the page.
-- **Scanline + Pixel Background** — Retro CRT scanline overlay and animated pixel grid backgrounds.
+### ⚡ Distributed Scalability & High Throughput
+- **Custom Go Load Balancer** — Layer 7 reverse proxy using Exponentially Weighted Moving Average (EWMA) response-time routing with active health probes.
+- **Valkey Primary/Replica Architecture** — Sys2 acts as the write primary; Sys3 and Sys4 act as read replicas.
+- **Async High-Throughput Endpoints** — Dedicated `/message` and `/feed` endpoints leveraging `redis.asyncio` pipeline batching and atomic deduplication.
+- **Incremental Delta Caching** — Micro-cache (250 ms) with double-checked locking serves `/feed` in $O(\Delta)$ time by fetching and merging only new messages instead of re-reading entire lists.
 
 ---
 
 ## Tech Stack
 
-| Layer              | Technology                                                                      |
-|--------------------|---------------------------------------------------------------------------------|
-| **Backend**        | Python 3.11+ · FastAPI · Gunicorn (4 workers) · Uvicorn workers · asyncio      |
-| **Load Balancer**  | Go 1.21+ · `net/http` · `net/http/httputil` · EWMA dynamic routing             |
-| **Shared Storage** | Valkey (Redis-compatible) · Primary on Sys2 · Replicas on Sys3, Sys4           |
-| **Security**       | `cryptography` (ECDSA-P256) · `bcrypt` · `hmac` · `secrets` · `hashlib`        |
-| **Frontend**       | HTML5 · Vanilla CSS · Vanilla JS (no frameworks, no build step)                 |
-| **Crypto**         | Web Crypto API (`SubtleCrypto`) — AES-GCM 256-bit + ECDSA-P256                 |
-| **Protocol**       | WebSockets (RFC 6455) `wss://` · REST HTTP/HTTPS                                |
-| **Fonts**          | Press Start 2P · VT323 (Google Fonts)                                           |
-| **TLS**            | Self-signed RSA-2048 certificate via Python `cryptography` library              |
+| Layer | Technology | Purpose |
+|---|---|---|
+| **Load Balancer** | Go (standard library only) | Layer 7 reverse proxy with EWMA dynamic routing and connection pooling |
+| **Backend** | Python 3.10+, FastAPI, Uvicorn, Gunicorn | REST API, WebSockets, auth, message validation |
+| **Database** | Valkey (Redis-compatible) | In-memory datastore with primary-replica replication |
+| **Async Redis** | `redis.asyncio` (`redis-py` 5.0+) | Non-blocking Redis I/O on FastAPI event loop |
+| **Crypto (Client)** | Web Crypto API (`SubtleCrypto`) | AES-GCM-256 encryption, ECDSA-P256 signing |
+| **Crypto (Server)** | Python `cryptography`, `bcrypt`, `hmac` | ECDSA verification, password hashing, HMAC tamper detection |
+| **Frontend** | Vanilla HTML5, CSS3, JavaScript (ES2022) | Single-page app (Login → Lobby → Chat), no external UI frameworks |
+| **Load Generator** | Go (goroutines, HTTP client) | Concurrent virtual user load generator |
+| **Monitoring** | Python, `psutil`, `matplotlib` | Host resource monitoring and evaluation plot generation |
 
 ---
 
-## Deployment Architecture
+## Deployment Architecture & Port Mappings
 
-### Lab System Layout
+### Port Mapping
+
+| System | Host ID | SSH Port | Internal Port | External Port | Deployed Services |
+|---|---|---|---|---|---|
+| **Sys1** | 1 | `2273` | `4000`<br>`3000` | `4273`<br>`3273` | **Load Balancer** (External entry: `http://10.1.75.51:4273`)<br>*Optional Frontend Static Server* |
+| **Sys2** | 2 | `2274` | `5000`<br>`6000` | `5274`<br>`6274` | **Backend 1** (`https://10.1.75.51:5274`)<br>**Valkey Primary** (Write client target: `6274`) |
+| **Sys3** | 3 | `2275` | `5000`<br>`6000` | `5275`<br>`6275` | **Backend 2** (`https://10.1.75.51:5275`)<br>**Valkey Replica** (Replicates from Sys2 `:6274`) |
+| **Sys4** | 4 | `2276` | `5000`<br>`6000` | `5276`<br>`6276` | **Backend 3** (`https://10.1.75.51:5276`)<br>**Valkey Replica** (Replicates from Sys2 `:6274`) |
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                                LAB NETWORK (10.1.75.51)                                │
 │                                                                                        │
 │  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
-│  │ SYS1 (SSH :2273) — Ingress & Static Hosting                                      │  │
+│  │ SYS1 (SSH :2273) — Ingress / Load Balancer                                       │  │
 │  │                                                                                  │  │
 │  │  ┌───────────────────────────────────────────────────┐                           │  │
-│  │  │ Load Balancer (Go)                   :4273 (HTTP) │                           │  │
+│  │  │ Load Balancer (Go)       internal :4000 -> :4273  │                           │  │
 │  │  │ · EWMA Dynamic Routing & Active Health Probes     │                           │  │
 │  │  │ · Connection Pool (64 idle) & Live /lb/status     │                           │  │
 │  │  └─────────────────────────┬─────────────────────────┘                           │  │
@@ -160,80 +106,36 @@ The backend is deployed across **three systems** behind a custom **Go load balan
 │        │               ││               ││               │                             │
 │        │ Valkey        ││ Valkey        ││ Valkey        │                             │
 │        │ PRIMARY (rw)  ││ REPLICA (ro)  ││ REPLICA (ro)  │                             │
-│        │ :6274         ││ :6000         ││ :6000         │                             │
+│        │ :6274         ││ :6275         ││ :6276         │                             │
 │        └───────┬───────┘└───────▲───────┘└───────▲───────┘                             │
 │                │                │                │                                     │
 │                └─ Replication ──┴────────────────┘                                     │
-│                   (Async Snapshot & Stream Sync)                                       │
+│                   (Sys3 & Sys4 replicate from Sys2 :6274)                              │
 └───────────────────────┼────────────────────────────────────────────────────────────────┘
                         ▲                                               
                REST/WS  │ (HTTP :4273)                                  
                         │                                               
         ┌───────────────┴──────────────────────────────────────────────────────────────┐
-        │                                Load Generator                                │
+        │                        Load Generator / Client                               │
         └──────────────────────────────────────────────────────────────────────────────┘
 ```
-
-### Port Mapping
-
-Ports are derived from SSH port using: `App_N_Port = SSH_Port + (N × 1000)`
-
-| System | SSH Port | Role | External Port | Internal Port |
-|--------|----------|------|---------------|---------------|
-| Sys1   | 2273     | Load Balancer | 4273 | 4000 |
-| Sys2   | 2274     | Backend 1 / Valkey Primary | 5274 / 6274 | 5000 / 6000 |
-| Sys3   | 2275     | Backend 2 / Valkey Replica | 5275 | 5000 |
-| Sys4   | 2276     | Backend 3 / Valkey Replica | 5276 | 5000 |
-
-### Component Responsibilities
-
-| Component | File | Role |
-|---|---|---|
-| **Load Balancer** | `load_balancer/main.go` | EWMA routing, health probes, `/lb/status`, `/lb/metrics` |
-| **Backend Server** | `server/server.py` | FastAPI app: REST API, WebSocket hub, auth, XP, ECDSA verification |
-| **Database Layer** | `server/db.py` | Valkey CRUD, HMAC tamper detection, 200-message feed cap |
-| **Frontend Client** | `client/app.js` | WebSocket client, SubtleCrypto encryption, gamification, UI |
-| **UI** | `client/index.html` + `client/style.css` | Three-screen SPA (Login → Lobby → Chat), retro pixel theme |
-| **Frontend Server** | `client/serve.py` | HTTPS static file server (FastAPI + uvicorn) |
-| **Load Generator** | `load_generator/load_gen` | Go-based concurrent load tester with EWMA-aware metrics |
-| **Monitor** | `monitor/monitor.py` | Per-system CPU/memory/network collector (psutil) |
-| **Certificate Generator** | `generate_certs.py` | Generates RSA-2048 self-signed TLS cert + key |
 
 ---
 
 ## Load Balancer (Go)
 
-The load balancer (`load_balancer/main.go`) is a Layer 7 HTTP reverse proxy written from scratch in Go using only the standard library.
+The load balancer (`load_balancer/main.go`) is a custom Layer 7 HTTP reverse proxy written in Go using only the standard library.
 
-### EWMA-Based Dynamic Routing
-
-Traffic is distributed using an **Exponentially Weighted Moving Average** of per-backend response time:
-
-```
-score(b) = (InFlight(b) + 1) × EWMA(b)
-```
-
-The routing algorithm uses two passes:
-
-1. **Pass 1 — Best non-overloaded backend:** Selects the alive, non-overloaded backend with the lowest score (lowest queue depth × latency product).
-2. **Pass 2 — Fallback:** If all backends are overloaded, routes to the least busy alive backend to ensure progress.
-
-A backend is marked **overloaded** when its EWMA exceeds `--threshold-ms` (default 300 ms). The EWMA updates after every request:
-
-```
-EWMA_t = α × latency_t + (1 − α) × EWMA_{t−1}    (α = 0.3)
-```
-
-### Features
-
-- **Active health probes** — `GET /health` on each backend every 1 second; failed backends are automatically excluded
-- **Connection pooling** — shared `http.Transport` with 64 idle connections per backend host
-- **TLS passthrough** — `InsecureSkipVerify` for self-signed backend certificates
-- **Per-request timeout** — 800 ms hard deadline via `context.WithTimeout`
-- **Observability** — `/lb/health`, `/lb/status`, `/lb/metrics` endpoints
+### Key Features
+- **EWMA Response-Time Routing** — Balances requests by tracking moving average latency:
+  $$\text{EWMA}_{\text{new}} = \alpha \cdot \text{latency} + (1 - \alpha) \cdot \text{EWMA}_{\text{prev}}$$
+  Backends with lower latency receive proportionately more traffic.
+- **Error Cooldown** — A backend that experiences a timeout or error enters a cooldown window to prevent cascading failures.
+- **Connection Pooling** — Shared `http.Transport` keeping persistent keep-alive connections warm to minimize TCP/TLS handshake latency.
+- **Live Health Probing** — Background health checker queries `/health` on all backends every 1s and updates routing status.
+- **Observability** — `/lb/health`, `/lb/status`, and `/lb/metrics` endpoints expose real-time metrics, queue times, and backend scores.
 
 ### Startup Command
-
 ```bash
 cd load_balancer
 ./lb \
@@ -242,207 +144,85 @@ cd load_balancer
   -threshold-ms 300 \
   -ewma-alpha 0.3 \
   -health-interval 1s \
-  -backend-timeout 800ms
-```
-
-### Build
-
-```bash
-cd load_balancer
-go build -o lb .
+  -backend-timeout 2500ms
 ```
 
 ---
 
-## Load Generator
+## Load Generator & Testing Workflows
 
-A custom concurrent load generator (`load_generator/`) was built in Go to stress-test the system:
+The load generator (`load_generator/`) simulates concurrent virtual users executing reads (`GET /feed`) and writes (`POST /message`):
 
+### Running Load Tests
 ```bash
 cd load_generator
 ./load_gen \
   -url http://10.1.75.51:4273 \
-  -users 50 -duration 120s \
+  -users 50 \
+  -duration 120s \
   -min-interval 100ms -max-interval 500ms \
   -read-ratio 0.3 \
-  -experiment stress_50u -out results/
+  -experiment stress_50u \
+  -out results/
 ```
 
-**Key features:**
-- Virtual users (goroutines), each with independent session state
-- Configurable read/write ratio (`-read-ratio`)
-- Randomised inter-request interval (avoids thundering herd)
-- Outputs: JSON summary, timeseries CSV, latency CDF CSV
-- Metrics: RPS, dropout %, p50/p95/p99 latency
-
-**Build:**
+### Collecting System Metrics During Tests
+On each monitored system (or remotely via SSH), run the resource monitor:
 ```bash
-cd load_generator
-go build -o load_gen .
+# On Sys1, Sys2, Sys3, Sys4
+python3 monitor/monitor.py --duration 120 --interval 1 --out load_generator/results/sysN_monitor.csv
 ```
 
-### Performance Results
-
-| Experiment | Users | Duration | RPS | Dropout | p50 | p95 | p99 |
-|---|---|---|---|---|---|---|---|
-| `baseline_20u_v3` | 20 | 60 s | 50.00 | 0.00% | 33 ms | 381 ms | 914 ms |
-| `stress_monitored` | 50 | 120 s | 74.04 | 0.00% | 28 ms | 81 ms | 112 ms |
+### Generating Report Plots & Reading Results
+Once CSVs are generated in `load_generator/results/`, run `plot_results.py` to produce presentation-ready graphs:
+```bash
+python3 monitor/plot_results.py \
+  --results-dir load_generator/results \
+  --out load_generator/results/plots
+```
+Generated graphs in `load_generator/results/plots/`:
+1. `response_time_cdf.png` — Response time Cumulative Distribution Function.
+2. `response_time_timeseries.png` — Latency trend over test duration.
+3. `throughput_timeseries.png` — Request throughput (RPS) over time.
+4. `dropout_bar.png` — Error and timeout comparison.
+5. `sys_cpu.png` & `sys_mem.png` & `sys_net.png` — Per-machine CPU, RAM, and network utilization.
 
 ---
 
 ## Security & Encryption
 
-### End-to-End Message Encryption (AES-GCM)
-
-```
-Client (Browser)                          Server
-────────────────                          ──────
-1. Fetch 256-bit key from GET /group-key
-2. Import as CryptoKey (AES-GCM)
-   (key is non-extractable in JS memory)
-
-3. On send:
-   plaintext = user's message text
-   iv = crypto.getRandomValues(12 bytes)   ← fresh random IV per message
-   ciphertext = AES-GCM.encrypt(key, iv, plaintext)
-   → base64url encode both
-
-4. Sign:
-   material = ciphertext_b64 + iv_b64  (as UTF-8 bytes)
-   signature = ECDSA-P256.sign(privateKey, material)
-   → base64url encode (IEEE P1363 format, 64 bytes)
-
-5. WS send → { ciphertext, iv, signature, public_key }
-                                          ↓
-                                6. Verify ECDSA signature (P1363→DER)
-                                7. Save encrypted blob to SQLite
-                                   (AES ciphertext stored, NOT plaintext)
-                                8. Compute HMAC-SHA256(ciphertext+iv)
-                                   store as hmac_digest
-                                9. Broadcast to room
-
-Client (Browser — all recipients)
-──────────────────────────────────
-10. Receive { ciphertext, iv, signature, public_key }
-11. Verify ECDSA signature client-side (SubtleCrypto)
-12. Decrypt AES-GCM ciphertext → plaintext
-13. Render message bubble with security badge
-```
-
-### ECDSA Digital Signatures
-
-- Each user generates a **new ECDSA-P256 key pair** on every login/session start using `SubtleCrypto.generateKey`.
-- The **public key is exported as JWK** and sent to the server on WebSocket join and with every message.
-- The server stores the latest JWK in the `user_keys` table and **verifies every incoming message's signature** before persisting or broadcasting.
-- A signature covers the concatenation of `ciphertext_b64 + iv_b64` (as UTF-8 bytes), ensuring integrity of the encrypted blob.
-- The Python `cryptography` library converts the IEEE P1363 format (r‖s, 64 bytes) to DER for server-side verification.
-
-### HMAC-SHA256 Tamper Detection
-
-- On every `save_message()` call, the DB layer computes `HMAC-SHA256(ciphertext + iv)` using `HMAC_SECRET` from `.env`.
-- On history load (`get_history()`), every row re-computes the HMAC and compares with the stored `hmac_digest` using `hmac.compare_digest()` (constant-time comparison).
-- Any mismatch marks the message as `tampered: True` and triggers a `🚨 TAMPERED` badge in the UI and a `[SECURITY ALERT]` server log.
-
-### TLS / HTTPS
-
-- Both frontend (`serve.py`) and backend (`server.py`) use `uvicorn` with `ssl_keyfile` and `ssl_certfile` pointing to `key.pem` / `cert.pem`.
-- Self-signed RSA-2048 certificates are generated via `generate_certs.py` (Python `cryptography` library).
-- HTTPS is **mandatory** — the Web Crypto API (`SubtleCrypto`) is only available in secure contexts.
-
-### Authentication Flow
-
-```
-Register:
-  POST /register { username, password, avatar }
-  → bcrypt.hashpw(password, bcrypt.gensalt()) stored in DB
-  ← { token, username, avatar, xp }
-    token = secrets.token_hex(32)  ← stored in active_sessions dict
-
-Login:
-  POST /login { username, password }
-  → bcrypt.checkpw(password, stored_hash)
-  ← { token, username, avatar, xp }
-
-WebSocket Join:
-  WS send: { type: "join", token, public_key (JWK), room_id }
-  Server: active_sessions.pop(token)  ← token consumed (one-time use)
-  → validate room, register ECDSA key, send history + welcome
-```
+### End-to-End Encryption Flow (AES-GCM)
+1. User receives 256-bit group key via authenticated `GET /group-key` endpoint.
+2. Messages are encrypted in the browser with AES-GCM (generating a fresh 12-byte IV for every message).
+3. Sender signs `ciphertext + iv` using ECDSA-P256 (`SubtleCrypto`).
+4. Server validates ECDSA signature against the sender's registered public key.
+5. Server saves encrypted payload to Valkey and computes `HMAC-SHA256(ciphertext + iv)` for tamper detection.
+6. Recipients verify the ECDSA signature and decrypt the ciphertext in-browser.
 
 ---
 
-## Database Design
+## Database Design (Valkey)
 
-**File:** `server/chat.db` (SQLite, auto-created on first run)
+The datastore is built on **Valkey** (Redis-compatible) configured in a primary-replica topology:
 
-### Tables
-
-#### `messages`
-
-| Column | Type | Description |
+### Key Schema
+| Key | Type | Description |
 |---|---|---|
-| `id` | INTEGER PK | Auto-increment row ID |
-| `room_id` | TEXT | 6-char room code |
-| `msg_id` | TEXT | Client-generated UUID (stable reference for edits/deletes/replies) |
-| `username` | TEXT | Sender's username |
-| `avatar` | TEXT | Sender's avatar ID |
-| `ciphertext` | TEXT | Base64url AES-GCM ciphertext (**never plaintext**) |
-| `iv` | TEXT | Base64url 12-byte GCM IV |
-| `signature` | TEXT | Base64url ECDSA-P256 signature |
-| `public_key` | TEXT | JSON JWK of sender's ECDSA public key |
-| `timestamp` | TEXT | HH:MM:SS formatted time |
-| `hmac_digest` | TEXT | HMAC-SHA256 hex digest for tamper detection |
-| `sig_valid` | INTEGER | 1=valid, 0=invalid (recorded at receive time) |
-| `reply_to` | TEXT | `msg_id` of parent message (threaded reply) |
-| `is_deleted` | INTEGER | 1=soft-deleted (ciphertext cleared) |
-| `target_user` | TEXT | Non-null = whisper to this username |
-| `is_edited` | INTEGER | 1=message has been edited |
-| `created_at_ts` | REAL | Unix epoch for 5-minute edit window validation |
-| `attachment` | TEXT | JSON attachment metadata (url, fileName, fileType, fileSize) |
+| `msg:{msg_id}` | Hash | Message record (`room_id`, `username`, `ciphertext`, `iv`, `signature`, `public_key`, `timestamp`, `hmac_digest`, `simple`, `json`) |
+| `feed:list:{room_id}` | List | Pre-serialized JSON message entries for fast single-command `/feed` responses |
+| `feed:room:{room_id}` | Sorted Set | Index of message IDs ordered by timestamp (`score = ts`, `member = msg_id`) |
+| `feed:all` | Sorted Set | Global index of all messages ordered by timestamp |
+| `user:{username}` | Hash | User profile (`password_hash`, `avatar`, `created_at`, `xp`) |
+| `users:all` | Set | All registered usernames |
+| `room:{room_id}` | Hash | Room metadata (`id`, `name`, `created_by`, `created_at`, `is_public`, `avatar`) |
+| `rooms:all` | Set | All active room codes |
+| `key:{username}` | String | User's registered ECDSA-P256 public key (JWK JSON) |
+| `session:{token}` | String | Session tokens mapping to usernames with TTL |
 
-#### `users`
-
-| Column | Type | Description |
-|---|---|---|
-| `id` | INTEGER PK | Auto-increment |
-| `username` | TEXT UNIQUE | Case-insensitive unique username |
-| `password_hash` | TEXT | bcrypt hash |
-| `avatar` | TEXT | Avatar ID |
-| `created_at` | TEXT | Registration timestamp |
-| `xp` | INTEGER | Total accumulated XP |
-
-#### `rooms`
-
-| Column | Type | Description |
-|---|---|---|
-| `id` | TEXT PK | 6-char alphanumeric room code |
-| `name` | TEXT | Room display name (max 40 chars) |
-| `created_by` | TEXT | Username of creator |
-| `created_at` | TEXT | Creation timestamp |
-| `is_public` | INTEGER | 1=public (browsable), 0=private (code-only) |
-| `avatar` | TEXT | Room emoji avatar |
-
-#### `user_keys`
-
-| Column | Type | Description |
-|---|---|---|
-| `username` | TEXT PK | Username |
-| `public_key` | TEXT | Latest ECDSA-P256 JWK (JSON) |
-
-### Key Database Functions (db.py)
-
-| Function | Description |
-|---|---|
-| `init_db()` | Creates tables + runs migrations on startup |
-| `save_message(...)` | Persists encrypted message with HMAC |
-| `get_history(room_id, limit, username)` | Returns history with HMAC re-verification and whisper filtering |
-| `delete_message(msg_id, username)` | Soft-delete — sender only |
-| `edit_message(msg_id, username, ...)` | Re-encrypt + re-sign within 5-minute window |
-| `create_user / get_user` | User CRUD |
-| `add_xp / get_user_xp` | Atomic XP increment + read |
-| `create_room / get_room / list_rooms / delete_room` | Room CRUD |
-| `clear_room_history_by_creator` | Bulk-delete messages — creator only |
-| `register_user_key / get_user_key` | ECDSA public key registry |
+### High-Throughput Optimizations
+- **Atomic Deduplication**: Writes check `HSETNX msg:{msg_id} username <user>` to prevent duplicate processing.
+- **Pipelined Storage**: `HSET` + `ZADD` $\times 2$ + `RPUSH` sent in a single round-trip pipeline.
+- **Incremental Delta Caching**: Micro-cache (`_feed_cache`) with per-room `asyncio.Lock`. On miss, only newly appended items are fetched (`LRANGE feed:list:{room_id} prev_len -1`) and string-concatenated in $O(\Delta)$ time without re-serializing previous history.
 
 ---
 
@@ -457,117 +237,52 @@ WebSocket Join:
 | 🚪 Someone joins your room | **+3 XP** |
 | ⏱️ Per minute spent in a room (heartbeat) | **+5 XP** |
 
-### Rank Progression
-
-| Emoji | Rank | XP Required |
-|---|---|---|
-| 🌱 | NEWBIE | 0 |
-| 🗡️ | SQUIRE | 200 |
-| 🛡️ | KNIGHT | 600 |
-| 🏆 | CHAMPION | 1,500 |
-| 👑 | WARLORD | 4,000 |
-| ⭐ | LEGEND | 10,000 |
-
-- XP is **persistent** — stored in the `users` table, survives logout, room changes, and server restarts.
-- Rank promotions trigger an **animated level-up toast** ("★ LEVEL UP! ★") and an 8-bit ascending chime.
-- Both the **lobby header** and **chat sidebar** display the XP bar and current rank in real time.
+### Ranks
+`🌱 NEWBIE (0 XP)` → `🗡️ SQUIRE (200 XP)` → `🛡️ KNIGHT (600 XP)` → `🏆 CHAMPION (1,500 XP)` → `👑 WARLORD (4,000 XP)` → `⭐ LEGEND (10,000 XP)`
 
 ---
 
 ## WebSocket Message Protocol
 
-All messages are JSON with a `type` field. Transport is `wss://` (encrypted WebSocket over TLS).
-
 ### Client → Server
-
-| Type | Key Fields | Description |
-|---|---|---|
-| `join` | `token`, `public_key` (JWK), `room_id` | Authenticate and join a room |
-| `message` | `ciphertext`, `iv`, `signature`, `public_key`, `client_msg_id`, `attachment?`, `reply_to?`, `target_user?` | Send encrypted message (or whisper) |
-| `edit_message` | `msg_id`, `ciphertext`, `iv`, `signature`, `public_key` | Edit own message (within 5 minutes) |
-| `delete_message` | `msg_id` | Soft-delete own message |
-| `typing` | — | Signal composing state to room |
-| `heartbeat` | — | Sent every 60s for passive XP |
-| `clear_room_history` | — | Creator clears all room messages |
-| `delete_room` | — | Creator deletes the room |
+- `join`: `{ type: "join", token, public_key, room_id }`
+- `message`: `{ type: "message", ciphertext, iv, signature, public_key, client_msg_id, attachment?, reply_to?, target_user? }`
+- `edit_message`: `{ type: "edit_message", msg_id, ciphertext, iv, signature, public_key }`
+- `delete_message`: `{ type: "delete_message", msg_id }`
+- `typing`: `{ type: "typing" }`
+- `heartbeat`: `{ type: "heartbeat" }`
 
 ### Server → Client
-
-| Type | Key Fields | Description |
-|---|---|---|
-| `system` | `message`, `timestamp`, `room` | Welcome message on join |
-| `join` | `username`, `avatar`, `message`, `timestamp` | User joined notification |
-| `leave` | `username`, `message`, `timestamp` | User left notification |
-| `message` | `msg_id`, `username`, `avatar`, `ciphertext`, `iv`, `signature`, `public_key`, `sig_valid`, `attachment`, `reply_to`, `target_user`, `timestamp` | Broadcast encrypted message |
-| `message_deleted` | `msg_id`, `username` | Tombstone: message was deleted |
-| `message_edited` | `msg_id`, `username`, `ciphertext`, `iv`, `signature`, `public_key`, `sig_valid`, `is_edited` | Edited message payload |
-| `receipt` | `msg_id`, `status` | Delivery receipt (`sent` / `partial` / `delivered_all`) |
-| `userList` | `users` (list of `{username, avatar}`) | Current online players (deduplicated by username) |
-| `history` | `messages` | Full encrypted chat history for new joiner |
-| `room_history_cleared` | `room_id`, `username` | History was cleared by creator |
-| `room_deleted` | `room_id`, `username` | Room was deleted by creator |
-| `xp_update` | `xp`, `gained`, `reason` | Real-time XP notification |
-| `typing` | `username` | Another user is typing |
-| `error` | `message` | Error notification |
+- `system`: Welcome message and room metadata
+- `join` / `leave`: Player presence events
+- `message`: Encrypted message broadcast
+- `message_edited` / `message_deleted`: State modifications
+- `receipt`: Delivery receipt (`sent` / `partial` / `delivered_all`)
+- `userList`: Online user roster
+- `history`: Replay of encrypted messages for newly joined client
+- `xp_update`: Real-time XP status
 
 ---
 
 ## REST API Reference
 
-### Authentication
+### Load-Generator Endpoints
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/message` | Ingest message (`msg_id`, `client-name`, `msg`). Pipelined, atomic dedup. |
+| `GET` | `/feed` | Retrieve message feed (pre-serialized JSON list, delta micro-cached). |
 
+### Auth & Management
 | Method | Endpoint | Request Body | Response |
 |---|---|---|---|
 | `POST` | `/register` | `{username, password, avatar}` | `{token, username, avatar, xp}` |
 | `POST` | `/login` | `{username, password}` | `{token, username, avatar, xp}` |
-| `POST` | `/refresh-token` | `{username}` | `{token, username, avatar, xp}` |
-
-### Room Management
-
-| Method | Endpoint | Body / Params | Response |
-|---|---|---|---|
-| `GET` | `/rooms` | — | `{rooms: [...]}` with live `online` counts |
-| `POST` | `/rooms` | `{name, is_public, avatar, created_by}` | `{room_id, name, xp_awarded, ...}` |
-| `GET` | `/rooms/{room_id}` | — | Room metadata or 404 |
-| `DELETE` | `/rooms/{room_id}` | `{username}` | `{ok: true}` (creator only) |
-| `DELETE` | `/rooms/{room_id}/history` | `{username}` | `{ok: true}` (creator only) |
-
-### Files & Utilities
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/upload` | Upload a file; returns `{url, fileName, fileType, fileSize}` |
-| `GET` | `/uploads/<filename>` | Serve uploaded file (static) |
-| `GET` | `/group-key` | Return AES-256 group key (hex) from `.env` |
-| `GET` | `/users/{username}/xp` | Return user's current XP total |
-| `GET` | `/config.js` | Serve `window.PORT = <backend_port>;` for dynamic client config |
-| `GET` | `/health` | Health check — `{"status": "ok"}` |
-
----
-
-## File Attachment Support
-
-Files are uploaded via `POST /upload` before the message is sent. The returned URL is included in the encrypted message payload as the `attachment` field.
-
-| File Type | Rendering in Chat |
-|---|---|
-| `image/*` | Inline thumbnail; click to open full-size |
-| `video/*` | Inline `<video>` player |
-| `audio/*` | Inline `<audio>` player |
-| Voice memo (`.webm`) | Inline `<audio>` player |
-| PDF / Word / ZIP / other | Download card with file name, type icon, and file size |
-
----
-
-## Message Receipt System
-
-Each sent message gets an emoji receipt that updates when the server's `receipt` event arrives:
-
-| Emoji | Status | Meaning |
-|---|---|---|
-| 😴 | `sent` | Reached server; no other players currently online |
-| 😃 | `partial` | Delivered to some players, but not all |
-| 😎 | `delivered_all` | All players in the room received it |
+| `GET` | `/rooms` | — | `{rooms: [...]}` |
+| `POST` | `/rooms` | `{name, is_public, avatar, created_by}` | `{room_id, name, ...}` |
+| `POST` | `/upload` | Multipart file upload | `{url, fileName, fileType, fileSize}` |
+| `GET` | `/group-key` | — | `{key: "<hex>"}` |
+| `GET` | `/health` | — | `{"status": "ok"}` |
+| `GET` | `/config.js` | — | Sets dynamic backend port config |
 
 ---
 
@@ -576,139 +291,97 @@ Each sent message gets an emoji receipt that updates when the server's `receipt`
 ```
 group-chat-app/
 ├── .env                        # Runtime config (gitignored)
-├── .env.example                # Config template — copy to .env
+├── .env.example                # Config template
 ├── .gitignore
 ├── README.md
 ├── generate_certs.py           # RSA-2048 self-signed TLS cert generator
-├── cert.pem                    # TLS certificate (generated, gitignored)
-├── key.pem                     # TLS private key (generated, gitignored)
-├── report_lab6.tex             # Lab 6 submission report (LaTeX)
+├── cert.pem                    # TLS certificate (gitignored)
+├── key.pem                     # TLS private key (gitignored)
 │
-├── load_balancer/              # Go EWMA load balancer
-│   ├── main.go                 # LB implementation (EWMA routing, health, proxy)
-│   └── lb                      # Compiled binary (gitignored)
+├── load_balancer/              # Custom Go EWMA load balancer
+│   ├── main.go                 # Reverse proxy, health probes, EWMA logic
+│   └── lb                      # Compiled executable
 │
-├── load_generator/             # Go concurrent load testing tool
-│   ├── main.go                 # Virtual user load generator
-│   ├── load_gen                # Compiled binary (gitignored)
-│   └── results/                # Experiment outputs
-│       ├── *.json              # Per-experiment aggregate metrics
-│       ├── *_timeseries.csv    # Per-second RPS/latency timeseries
-│       ├── *_latencies.csv     # Per-request latency CDF data
+├── load_generator/             # Go load testing tool
+│   ├── main.go                 # Concurrent virtual user generator
+│   ├── load_gen                # Compiled executable
+│   └── results/                # Experiment outputs (CSVs, JSONs)
 │       └── plots/              # Generated performance charts
-│           ├── response_time_cdf.png
-│           ├── throughput_timeseries.png
-│           ├── dropout_bar.png
-│           ├── sys_cpu.png
-│           ├── sys_mem.png
-│           └── sys_net.png
 │
-├── monitor/                    # System resource monitoring
-│   ├── monitor.py              # psutil collector (CPU, RAM, network)
-│   └── plot_results.py         # Matplotlib chart generator
+├── monitor/                    # Host metrics collector and plotter
+│   ├── monitor.py              # psutil CPU/RAM/network sampler
+│   ├── plot_results.py         # Matplotlib report chart generator
+│   └── requirements.txt        # Monitor Python dependencies
 │
-├── valkey/                     # Valkey (Redis-compatible) config
+├── valkey/                     # Valkey configuration files
+│   ├── valkey-primary.conf     # Sys2 Primary configuration
+│   ├── valkey-replica-sys3.conf # Sys3 Replica configuration
+│   └── valkey-replica-sys4.conf # Sys4 Replica configuration
 │
 ├── server/
-│   ├── server.py               # FastAPI WebSocket + REST API server
-│   │                           #   ├── ConnectionManager (multi-room WS hub)
-│   │                           #   ├── Auth endpoints (/register, /login, /refresh-token)
-│   │                           #   ├── Room endpoints (/rooms CRUD)
-│   │                           #   ├── WebSocket handler (/ws) — full message lifecycle
-│   │                           #   ├── ECDSA-P256 signature verification
-│   │                           #   ├── XP award logic (send/receive/join/heartbeat/streak)
-│   │                           #   └── File upload handler (/upload)
-│   ├── db.py                   # Valkey database layer
-│   │                           #   ├── HMAC-SHA256 tamper detection
-│   │                           #   ├── 200-message feed cap (_FEED_LIMIT)
-│   │                           #   └── All CRUD functions (messages, users, rooms, keys)
-│   └── requirements.txt        # Python dependencies
+│   ├── server.py               # FastAPI application (WebSockets, REST endpoints)
+│   ├── db.py                   # Valkey database driver and caching logic
+│   └── requirements.txt        # Backend dependencies
 │
 └── client/
-    ├── index.html              # Three-screen SPA (Login → Lobby → Chat)
-    ├── style.css               # Retro 8-bit pixel dark theme + all component styles
-    ├── app.js                  # All client-side logic:
-    │                           #   ├── SubtleCrypto: AES-GCM encrypt/decrypt
-    │                           #   ├── SubtleCrypto: ECDSA-P256 sign/verify
-    │                           #   ├── WebSocket connect + all message type handlers
-    │                           #   ├── Auth flows (register/login/logout/token refresh)
-    │                           #   ├── Lobby (room creation, search, join by code)
-    │                           #   ├── Chat (send, receive, edit, delete, reply, whisper, @mention)
-    │                           #   ├── Gamification (XP tracking, rank calc, level-up toast)
-    │                           #   ├── Media (voice memo recording, file upload preview)
-    │                           #   ├── Typing indicator + emoji picker
-    │                           #   └── Auto-reconnect with exponential backoff
-    ├── serve.py                # HTTPS static file server (FastAPI + uvicorn)
-    └── sounds/                 # 8-bit retro sound effects
-        ├── coin.mp3            # New message sound
-        ├── pipe.mp3            # User leave sound
-        ├── mushroom.mp3        # User join sound
-        └── mario_start.mp3    # App startup / level-up sound
+    ├── index.html              # PixelChat SPA interface
+    ├── style.css               # 8-bit retro theme styling
+    ├── app.js                  # Client Web Crypto and WebSocket logic
+    ├── serve.py                # Optional static file server
+    └── sounds/                 # 8-bit audio effects
 ```
 
 ---
 
 ## Environment Configuration
 
-Copy `.env.example` to `.env` and fill in secrets:
-
-```env
-# Backend (FastAPI WebSocket server) port
-BACKEND_PORT=5000
-
-# Frontend (static file server) port
-FRONTEND_PORT=3269
-
-# Room cleanup timeout in seconds (default 300)
-CLEANUP_TIMEOUT=300
-
-# 256-bit AES-GCM group key — generate with:
-# python3 -c "import secrets; print(secrets.token_hex(32))"
-AES_GROUP_KEY=<64-hex-chars>
-
-# HMAC-SHA256 secret for database tamper detection — generate with:
-# python3 -c "import secrets; print(secrets.token_hex(32))"
-HMAC_SECRET=<64-hex-chars>
+Create `.env` from `.env.example`:
+```bash
+cp .env.example .env
 ```
 
-> **Security Note:** Never commit `.env` to version control. It is already listed in `.gitignore`. Both `AES_GROUP_KEY` and `HMAC_SECRET` must be exactly 64 hex characters (32 bytes each).
+Key environment variables:
+```env
+# Internal port on which FastAPI/Gunicorn binds (5000)
+PORT=5000
+
+# Reached by clients/frontend (e.g. 5274 on Sys2, 5275 on Sys3, 5276 on Sys4; or 4273 for LB)
+BACKEND_PORT=5000
+
+# 256-bit AES group key (64 hex chars)
+AES_GROUP_KEY=<64-hex-chars>
+
+# HMAC secret for message integrity (64 hex chars)
+HMAC_SECRET=<64-hex-chars>
+
+# Write client connects to Primary (Sys2 external 6274 or local 6000)
+VALKEY_PRIMARY_URL=redis://10.1.75.51:6274/0
+
+# Read client connects to local Valkey instance
+VALKEY_REPLICA_URL=redis://127.0.0.1:6000/0
+```
 
 ---
 
 ## Quick Start (Local)
 
 ### 1. Install Dependencies
-
 ```bash
 cd server
 pip install -r requirements.txt
 ```
 
-### 2. Set Up Environment
-
+### 2. Generate TLS Certificates
 ```bash
-cp .env.example .env
-# Edit .env — generate AES_GROUP_KEY and HMAC_SECRET
+python3 generate_certs.py
 ```
 
-### 3. Generate TLS Certificates
-
+### 3. Start Valkey (Terminal 1)
 ```bash
-python generate_certs.py
-# Outputs: cert.pem and key.pem
+valkey-server --port 6000
 ```
 
-> Required because `SubtleCrypto` only works in HTTPS contexts.
-
-### 4. Start Valkey (Terminal 1)
-
-```bash
-sudo service valkey-server start
-# or: valkey-server --port 6000
-```
-
-### 5. Start the Backend (Terminal 2)
-
+### 4. Start Backend Server (Terminal 2)
 ```bash
 cd server
 gunicorn server:app \
@@ -716,95 +389,53 @@ gunicorn server:app \
   --worker-class uvicorn.workers.UvicornWorker \
   --bind 0.0.0.0:5000 \
   --certfile ../cert.pem \
-  --keyfile ../key.pem \
-  --timeout 120 \
-  --graceful-timeout 30
+  --keyfile ../key.pem
 ```
 
-### 6. Start the Frontend (Terminal 3)
-
+### 5. Optional: Start Frontend Server (Terminal 3)
 ```bash
-cd client
-python3 serve.py
+python3 client/serve.py
+# Open https://localhost:3000 in browser
 ```
-
-### 7. Open in Browser
-
-```
-https://localhost:<FRONTEND_PORT>
-```
-
-> Accept the self-signed certificate for both frontend and backend ports on first load.
 
 ---
 
 ## Lab Deployment (Multi-Machine)
 
-> **🌐 Load Balancer:** `http://10.1.75.51:4273`
-> **🖥️ Frontend:** `https://10.1.75.51:3269`
-
-### On Sys2, Sys3, Sys4 (each backend)
-
+### 1. Backends (Sys2, Sys3, Sys4)
+On each backend machine:
 ```bash
-# 1. Start local Valkey replica (Sys3, Sys4 only — Sys2 is the primary)
-sudo service valkey-server restart
 
-# 2. Start backend with gunicorn
-cd ~/group-chat-app/server
+# Start Valkey (Sys2 runs as primary; Sys3/Sys4 run as replica)
+valkey-server valkey/valkey-<role>.conf
+
+# Start FastAPI application
+cd server
 gunicorn server:app \
   --workers 4 \
   --worker-class uvicorn.workers.UvicornWorker \
   --bind 0.0.0.0:5000 \
-  --certfile cert.pem \
-  --keyfile key.pem \
-  --timeout 120 \
-  --graceful-timeout 30
+  --certfile ../cert.pem \
+  --keyfile ../key.pem \
+  --timeout 120
 ```
 
-### On Sys1 (load balancer + frontend)
-
+### 2. Load Balancer (Sys1)
+On Sys1:
 ```bash
-# 1. Start load balancer
-cd ~/group-chat-app/load_balancer
+cd load_balancer
 ./lb \
   -addr :4000 \
   -backends "https://10.1.75.51:5274,https://10.1.75.51:5275,https://10.1.75.51:5276" \
   -threshold-ms 300 \
   -ewma-alpha 0.3 \
   -health-interval 1s \
-  -backend-timeout 800ms
-
-# 2. Start frontend
-cd ~/group-chat-app/client
-python3 serve.py
+  -backend-timeout 2500ms
 ```
 
-### Verify deployment
-
+### 3. Verify Deployment
 ```bash
-# Check all backends are healthy
+# Check load balancer health & backends status
 curl http://10.1.75.51:4273/lb/status | python3 -m json.tool
-
-# Expect: all three backends alive=true, overloaded=false
 ```
-
-> **Tip:** Always restart the LB before an evaluation to reset EWMA state to zero for all backends.
-
----
-
-## Python Dependencies
-
-```
-fastapi
-uvicorn[standard]
-python-dotenv
-python-multipart
-cryptography
-bcrypt
-```
-
----
-
----
-
-*PixelChat — Group Quest v2.0 | CSD Lab 4 → Lab 6: Load Balanced Distributed Deployment*
+Expect all three backends to report `alive: true`.

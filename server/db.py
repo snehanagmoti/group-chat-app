@@ -1,9 +1,9 @@
 """
 Database layer for the Secure Persistent Group Chat.
 
-Uses redis-py for Valkey (Redis-compatible) with an active-active primary/replica
+Uses redis-py for Valkey (Redis-compatible) with a primary-replica
 architecture:
-  - _rw  →  VALKEY_PRIMARY_URL  (write client: all mutations go to the primary)
+  - _rw  →  VALKEY_PRIMARY_URL  (write client: mutations go to the Sys2 primary)
   - _ro  →  VALKEY_REPLICA_URL  (read client: reads served from the local replica)
 
 When both env vars are the same (or only VALKEY_URL is set), both clients point to
@@ -44,19 +44,11 @@ _primary_url = os.environ.get(
 # Falls back to primary URL if not set (single-node mode).
 _replica_url = os.environ.get("VALKEY_REPLICA_URL", _primary_url)
 
-# Write client — connected to primary.
-# socket_timeout / socket_connect_timeout: without these, redis-py blocks
-# INDEFINITELY on a stalled connection (dropped packet, momentarily
-# unreachable replica, etc). Since db calls run inside asyncio.to_thread(),
-# an indefinite block eats a threadpool slot permanently — enough of those
-# under sustained load exhausts the pool and the whole process stops
-# answering requests, including plain health checks, and never recovers
-# even after traffic stops. A bounded timeout turns that into a fast,
-# recoverable error instead.
+# Write client — connected to primary with bounded timeouts and auto-retry.
 _rw = redis.from_url(
     _primary_url,
     decode_responses=False,
-    socket_timeout=10,         # large enough for LRANGE of 5000+ entries under load
+    socket_timeout=10,
     socket_connect_timeout=2,
     health_check_interval=30,
     retry_on_timeout=True,
@@ -66,18 +58,14 @@ _rw = redis.from_url(
 _ro = redis.from_url(
     _replica_url,
     decode_responses=False,
-    socket_timeout=10,         # large enough for LRANGE of 5000+ entries under load
+    socket_timeout=10,
     socket_connect_timeout=2,
     health_check_interval=30,
     retry_on_timeout=True,
 )
 
-# ── Async Redis clients (used ONLY by /message and /feed hot paths) ───────────
-# redis.asyncio uses the event loop for I/O instead of OS threads:
-#   - sync client: 1 blocked OS thread per in-flight Redis call
-#   - async client: 0 OS threads — I/O is multiplexed on the event loop
-# At 500 concurrent users, the sync approach needed 167 thread slots per
-# backend; async needs 0, so the thread-pool ceiling is no longer a factor.
+# ── Async Redis clients (used by /message and /feed hot paths) ────────────────
+# redis.asyncio multiplexes I/O on the event loop without consuming worker threads.
 _rw_async = aioredis.from_url(
     _primary_url,
     decode_responses=False,
@@ -448,19 +436,9 @@ def edit_message(
 _feed_cache: dict[str, tuple[float, str, int]] = {}
 _CACHE_TTL_SEC = 0.25  # 250ms micro-cache coalesces high-concurrency read spikes
 # Per-room Lock used to single-flight cache misses in get_feed_json_async.
-# When the cache expires under high concurrency, ONE coroutine acquires the
-# lock and does the LRANGE+merge; all other waiters check the double-check
-# inside the lock and return the freshly populated entry immediately.
-#
-# asyncio.Task (singleflight) was tried but has two failure modes in this
-# workload:
-#   1. CancelledError (BaseException) is not caught by `except Exception`,
-#      so Gunicorn worker rotation causes a cascade of CancelledError to
-#      every coroutine awaiting the shared Task simultaneously.
-#   2. create_task() queues the Task at the BACK of the event-loop ready
-#      queue; under 1000 concurrent coroutines the Task's scheduling delay
-#      can exceed the LB's 2500ms timeout, failing all waiters at once.
-# The Lock's FIFO convoy is the lesser cost.
+# When the cache expires under high concurrency, one coroutine acquires the
+# lock to fetch the delta and update the cache; subsequent waiters hit the
+# double-check and return the refreshed cache immediately.
 _feed_lock: dict[str, asyncio.Lock] = {}
 
 def _append_items(prev_json: str, new_items: list) -> str:
@@ -525,14 +503,8 @@ def get_feed_json(room_id: str = "loadtest") -> str:
     2. Fast path: 1 single Redis command (LRANGE) reading pre-serialized JSON.
     3. Auto-backfills feed:list if unpopulated.
 
-    NOTE: reads from _rw (primary), not _ro (replica). This deployment runs
-    the LB round-robining across 3 backend containers (1 fronting the primary,
-    2 fronting replicas). A write on one container's primary connection can
-    lag behind on another container's replica connection, so a POST /message
-    immediately followed by a GET /feed against a different backend could miss
-    the just-written message. /message and /feed are the exact load-tested
-    endpoints, so they read-your-writes off primary; everything else in this
-    file (room lookups, chat history, etc.) still reads from the replica.
+    # Reads from _rw (primary) to guarantee read-your-writes consistency
+    # across load-balanced backend nodes during high write throughput.
     """
     now = time.time()
     cached = _feed_cache.get(room_id)
@@ -592,23 +564,15 @@ def get_all_messages_simple(room_id: str = "loadtest") -> list[dict]:
     return json.loads(get_feed_json(room_id))
 
 
-# ── Async hot-path functions (event-loop native, 0 threads) ───────────────────
+# ── Async hot-path functions ──────────────────────────────────────────────────
 
 async def save_message_simple_async(
     msg_id: str, room_id: str, username: str, text: str
 ) -> bool:
     """
     Async version of save_message_simple for the /message load-test endpoint.
-
-    Uses _rw_async (redis.asyncio) so every Redis call is a coroutine that
-    suspends with `await` instead of blocking an OS thread. Under 500
-    concurrent requests this means 500 coroutines interleaved on the event
-    loop — not 500 threads stacked in the kernel.
-
-    Logic is identical to the sync version:
-      1. HSETNX for atomic dedup (returns False immediately if duplicate).
-      2. 4-command pipeline: HSET + ZADD×2 + RPUSH — all sent in one
-         round-trip, minimising latency per request.
+    Performs atomic dedup via HSETNX followed by a pipelined batch write
+    (HSET + ZADDx2 + RPUSH) in a single round-trip.
     """
     key = f"msg:{msg_id}"
     inserted = await _rw_async.hsetnx(key, "username", username)

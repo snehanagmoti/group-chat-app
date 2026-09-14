@@ -1,0 +1,13 @@
+{
+  "experiment": "stress_50u",
+  "users": 50,
+  "duration_sec": 121.490184942,
+  "successful": 6922,
+  "failed": 2,
+  "total": 6924,
+  "throughput_rps": 56.975796055496964,
+  "dropout_percent": 0.028885037550548814,
+  "p50_ms": 50.014,
+  "p95_ms": 103.674,
+  "p99_ms": 154.703
+}

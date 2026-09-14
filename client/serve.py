@@ -1,7 +1,7 @@
 """
 Frontend Static File Server
 ============================
-Serves the client/ directory on FRONTEND_PORT (default 5000).
+Serves the client/ directory on FRONTEND_PORT (default 3000).
 Run from the project root:  python client/serve.py
 """
 
@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
-FRONTEND_PORT = int(os.environ.get("FRONTEND_PORT", 5000))
+FRONTEND_PORT = int(os.environ.get("FRONTEND_PORT", 3000))
 CLIENT_DIR = Path(__file__).resolve().parent
 
 if __name__ == "__main__":
