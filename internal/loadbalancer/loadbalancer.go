@@ -3,13 +3,15 @@ package loadbalancer
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
+	"compress/flate"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"net"
@@ -31,20 +33,18 @@ const (
 	affinityCookieName         = "pixelchat_backend"
 	feedJSONPrefix             = `{"messages":[`
 	feedJSONSuffix             = `]}`
-	maxConcurrentFeedResponses = 16
+	maxConcurrentFeedResponses = 256
+	feedCompressionBatchBytes  = 32 << 10
 	serverReadBufferBytes      = 16 << 10
 	serverWriteBufferBytes     = 32 << 10
 )
 
-var feedGzipWriters = sync.Pool{
-	New: func() any {
-		writer, err := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
-		if err != nil {
-			panic(err)
-		}
-		return writer
-	},
-}
+var (
+	feedJSONPrefixBytes    = []byte(feedJSONPrefix)
+	feedJSONSuffixBytes    = []byte(feedJSONSuffix)
+	feedJSONSeparatorBytes = []byte{','}
+	feedGzipHeader         = []byte{0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0xff}
+)
 
 type Backend struct {
 	ID       int
@@ -112,40 +112,110 @@ type Metrics struct {
 	latencies     *latencyTracker
 }
 
-// feedStore keeps the canonical Lab 6 feed as already-encoded JSON objects.
-// Readers share its append-only bytes, avoiding a full-feed allocation per GET.
+// feedStore keeps the canonical Lab 6 feed as already-encoded JSON objects and
+// an incrementally compressed gzip stream. Readers share immutable snapshots of
+// both representations, avoiding a full-feed allocation or recompression per GET.
 type feedStore struct {
 	mu           sync.RWMutex
-	data         []byte
+	generation   *feedGeneration
 	dataCapacity int
+}
+
+type feedGeneration struct {
+	data              []byte
+	compressed        []byte
+	compressedThrough int
+	compressor        *flate.Writer
+	crc               uint32
+	uncompressedSize  uint32
+}
+
+type feedSnapshot struct {
+	messages         []byte
+	compressed       []byte
+	compressedTail   []byte
+	crc              uint32
+	uncompressedSize uint32
+}
+
+type sliceAppender struct {
+	target *[]byte
+}
+
+func (writer sliceAppender) Write(payload []byte) (int, error) {
+	*writer.target = append(*writer.target, payload...)
+	return len(payload), nil
 }
 
 func newFeedStore(initialCapacity int) *feedStore {
 	return &feedStore{
-		data:         make([]byte, 0, initialCapacity),
+		generation:   newFeedGeneration(initialCapacity),
 		dataCapacity: initialCapacity,
+	}
+}
+
+func newFeedGeneration(dataCapacity int) *feedGeneration {
+	generation := &feedGeneration{
+		data:             make([]byte, 0, dataCapacity),
+		compressed:       append(make([]byte, 0, dataCapacity/4), feedGzipHeader...),
+		crc:              crc32.Update(0, crc32.IEEETable, feedJSONPrefixBytes),
+		uncompressedSize: uint32(len(feedJSONPrefixBytes)),
+	}
+	compressor, err := flate.NewWriter(sliceAppender{target: &generation.compressed}, flate.BestSpeed)
+	if err != nil {
+		panic(fmt.Sprintf("create feed compressor: %v", err))
+	}
+	generation.compressor = compressor
+	generation.writeCompressed(feedJSONPrefixBytes)
+	return generation
+}
+
+func (generation *feedGeneration) writeCompressed(payload []byte) {
+	if _, err := generation.compressor.Write(payload); err != nil {
+		panic(fmt.Sprintf("compress feed: %v", err))
+	}
+	if err := generation.compressor.Flush(); err != nil {
+		panic(fmt.Sprintf("flush feed compressor: %v", err))
 	}
 }
 
 func (store *feedStore) append(message []byte) {
 	store.mu.Lock()
-	if len(store.data) != 0 {
-		store.data = append(store.data, ',')
+	generation := store.generation
+	if len(generation.data) != 0 {
+		generation.data = append(generation.data, ',')
+		generation.crc = crc32.Update(generation.crc, crc32.IEEETable, feedJSONSeparatorBytes)
+		generation.uncompressedSize++
 	}
-	store.data = append(store.data, message...)
+	generation.data = append(generation.data, message...)
+	generation.crc = crc32.Update(generation.crc, crc32.IEEETable, message)
+	generation.uncompressedSize += uint32(len(message))
+
+	if len(generation.data)-generation.compressedThrough >= feedCompressionBatchBytes {
+		generation.writeCompressed(generation.data[generation.compressedThrough:])
+		generation.compressedThrough = len(generation.data)
+	}
 	store.mu.Unlock()
 }
 
-func (store *feedStore) snapshot() []byte {
+func (store *feedStore) snapshot() feedSnapshot {
 	store.mu.RLock()
-	snapshot := store.data[:len(store.data):len(store.data)]
+	generation := store.generation
+	snapshot := feedSnapshot{
+		messages:         generation.data[:len(generation.data):len(generation.data)],
+		compressed:       generation.compressed[:len(generation.compressed):len(generation.compressed)],
+		compressedTail:   generation.data[generation.compressedThrough:len(generation.data):len(generation.data)],
+		crc:              generation.crc,
+		uncompressedSize: generation.uncompressedSize,
+	}
 	store.mu.RUnlock()
 	return snapshot
 }
 
 func (store *feedStore) clear() {
+	generation := newFeedGeneration(store.dataCapacity)
 	store.mu.Lock()
-	store.data = make([]byte, 0, store.dataCapacity)
+	store.generation = generation
 	store.mu.Unlock()
 }
 
@@ -451,23 +521,24 @@ func (lb *LoadBalancer) handleFeed(response http.ResponseWriter, request *http.R
 		}
 	}
 
-	messages := lb.feed.snapshot()
-	contentLength := len(feedJSONPrefix) + len(messages) + len(feedJSONSuffix)
+	feed := lb.feed.snapshot()
+	contentLength := len(feedJSONPrefix) + len(feed.messages) + len(feedJSONSuffix)
 	response.Header().Set("Content-Type", "application/json")
 	response.Header().Set("Vary", "Accept-Encoding")
 
 	var writeError error
 	if request.Method == http.MethodGet && acceptsGzip(request.Header.Get("Accept-Encoding")) {
 		response.Header().Set("Content-Encoding", "gzip")
+		response.Header().Set("Content-Length", strconv.Itoa(feed.gzipContentLength()))
 		response.WriteHeader(http.StatusOK)
-		writeError = writeGzipFeed(response, messages)
+		writeError = writeGzipFeed(response, feed)
 	} else {
 		response.Header().Set("Content-Length", strconv.Itoa(contentLength))
 		response.WriteHeader(http.StatusOK)
 		if request.Method == http.MethodGet {
 			if _, err := io.WriteString(response, feedJSONPrefix); err != nil {
 				writeError = err
-			} else if _, err := response.Write(messages); err != nil {
+			} else if _, err := response.Write(feed.messages); err != nil {
 				writeError = err
 			} else if _, err := io.WriteString(response, feedJSONSuffix); err != nil {
 				writeError = err
@@ -506,16 +577,53 @@ func acceptsGzip(header string) bool {
 	return false
 }
 
-func writeGzipFeed(response io.Writer, messages []byte) error {
-	writer := feedGzipWriters.Get().(*gzip.Writer)
-	writer.Reset(response)
-	_, prefixError := io.WriteString(writer, feedJSONPrefix)
-	_, messagesError := writer.Write(messages)
-	_, suffixError := io.WriteString(writer, feedJSONSuffix)
-	closeError := writer.Close()
-	writer.Reset(io.Discard)
-	feedGzipWriters.Put(writer)
-	return errors.Join(prefixError, messagesError, suffixError, closeError)
+func (snapshot feedSnapshot) gzipContentLength() int {
+	return len(snapshot.compressed) + 5 + len(snapshot.compressedTail) + len(feedJSONSuffixBytes) + 8
+}
+
+func writeGzipFeed(response io.Writer, snapshot feedSnapshot) error {
+	storedLength := len(snapshot.compressedTail) + len(feedJSONSuffixBytes)
+	if storedLength > 0xffff {
+		return fmt.Errorf("feed compression tail is too large: %d bytes", storedLength)
+	}
+
+	var storedHeader [5]byte
+	storedHeader[0] = 0x01 // Final DEFLATE block using uncompressed storage.
+	binary.LittleEndian.PutUint16(storedHeader[1:3], uint16(storedLength))
+	binary.LittleEndian.PutUint16(storedHeader[3:5], ^uint16(storedLength))
+
+	var trailer [8]byte
+	checksum := crc32.Update(snapshot.crc, crc32.IEEETable, feedJSONSuffixBytes)
+	binary.LittleEndian.PutUint32(trailer[0:4], checksum)
+	binary.LittleEndian.PutUint32(trailer[4:8], snapshot.uncompressedSize+uint32(len(feedJSONSuffixBytes)))
+
+	if err := writeFeedPart(response, snapshot.compressed); err != nil {
+		return err
+	}
+	if err := writeFeedPart(response, storedHeader[:]); err != nil {
+		return err
+	}
+	if err := writeFeedPart(response, snapshot.compressedTail); err != nil {
+		return err
+	}
+	if err := writeFeedPart(response, feedJSONSuffixBytes); err != nil {
+		return err
+	}
+	return writeFeedPart(response, trailer[:])
+}
+
+func writeFeedPart(writer io.Writer, payload []byte) error {
+	for len(payload) != 0 {
+		written, err := writer.Write(payload)
+		if err != nil {
+			return err
+		}
+		if written == 0 {
+			return io.ErrShortWrite
+		}
+		payload = payload[written:]
+	}
+	return nil
 }
 
 func (lb *LoadBalancer) handleClear(response http.ResponseWriter, request *http.Request) {

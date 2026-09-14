@@ -119,6 +119,7 @@ func TestLab6ClearAndValidation(t *testing.T) {
 
 func TestLab6FeedUsesGzipWhenAccepted(t *testing.T) {
 	balancer := testBalancer(t, "http://one.test", nil)
+	balancer.feed.append([]byte(`{"msg":"compressed"}`))
 	server := httptest.NewServer(balancer.handler())
 	defer server.Close()
 
@@ -136,7 +137,14 @@ func TestLab6FeedUsesGzipWhenAccepted(t *testing.T) {
 	if encoding := response.Header.Get("Content-Encoding"); encoding != "gzip" {
 		t.Fatalf("Content-Encoding = %q, want gzip", encoding)
 	}
-	reader, err := gzip.NewReader(response.Body)
+	compressedBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read compressed feed: %v", err)
+	}
+	if response.ContentLength != int64(len(compressedBody)) {
+		t.Fatalf("Content-Length = %d, wrote %d bytes", response.ContentLength, len(compressedBody))
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(compressedBody))
 	if err != nil {
 		t.Fatalf("open gzip feed: %v", err)
 	}
@@ -145,9 +153,148 @@ func TestLab6FeedUsesGzipWhenAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read feed: %v", err)
 	}
-	if string(feedBody) != `{"messages":[]}` {
+	if string(feedBody) != `{"messages":[{"msg":"compressed"}]}` {
 		t.Fatalf("feed = %q", feedBody)
 	}
+}
+
+func TestAcceptsGzipHonorsQuality(t *testing.T) {
+	for _, testCase := range []struct {
+		header string
+		want   bool
+	}{
+		{header: "gzip", want: true},
+		{header: "br, gzip;q=0.5", want: true},
+		{header: "gzip;q=0", want: false},
+		{header: "identity", want: false},
+	} {
+		if got := acceptsGzip(testCase.header); got != testCase.want {
+			t.Errorf("acceptsGzip(%q) = %t, want %t", testCase.header, got, testCase.want)
+		}
+	}
+}
+
+func TestLab6GzipSnapshotsRemainValidAcrossAppendAndClear(t *testing.T) {
+	store := newFeedStore(64)
+	store.append([]byte(`{"msg":"first"}`))
+	first := store.snapshot()
+
+	for index := 0; index < 2000; index++ {
+		store.append([]byte(fmt.Sprintf(`{"msg":"message-%04d"}`, index)))
+	}
+	full := store.snapshot()
+	if len(full.compressedTail) >= feedCompressionBatchBytes {
+		t.Fatalf("uncompressed tail = %d bytes, want less than %d", len(full.compressedTail), feedCompressionBatchBytes)
+	}
+
+	store.clear()
+	empty := store.snapshot()
+
+	if got := decodeGzipSnapshot(t, first); got != `{"messages":[{"msg":"first"}]}` {
+		t.Fatalf("first snapshot changed: %s", got)
+	}
+	var feed struct {
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(decodeGzipSnapshot(t, full)), &feed); err != nil {
+		t.Fatalf("decode full snapshot: %v", err)
+	}
+	if len(feed.Messages) != 2001 {
+		t.Fatalf("full snapshot contains %d messages, want 2001", len(feed.Messages))
+	}
+	if got := decodeGzipSnapshot(t, empty); got != `{"messages":[]}` {
+		t.Fatalf("feed after clear = %s", got)
+	}
+}
+
+func TestLab6HandlesConcurrentFeedReadersAndAppends(t *testing.T) {
+	balancer := testBalancer(t, "http://one.test", nil)
+	for index := 0; index < 200; index++ {
+		balancer.feed.append([]byte(fmt.Sprintf(`{"msg":"message-%04d"}`, index)))
+	}
+	server := httptest.NewServer(balancer.handler())
+	defer server.Close()
+
+	const readerCount = 300
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        readerCount,
+			MaxIdleConnsPerHost: readerCount,
+		},
+	}
+	defer client.CloseIdleConnections()
+
+	start := make(chan struct{})
+	errors := make(chan error, readerCount)
+	appendDone := make(chan struct{})
+	go func() {
+		defer close(appendDone)
+		<-start
+		for index := 200; index < 300; index++ {
+			balancer.feed.append([]byte(fmt.Sprintf(`{"msg":"message-%04d"}`, index)))
+		}
+	}()
+
+	var waitGroup sync.WaitGroup
+	for range readerCount {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			<-start
+			response, err := client.Get(server.URL + "/feed")
+			if err != nil {
+				errors <- err
+				return
+			}
+			defer response.Body.Close()
+			var feed struct {
+				Messages []json.RawMessage `json:"messages"`
+			}
+			if err := json.NewDecoder(response.Body).Decode(&feed); err != nil {
+				errors <- err
+				return
+			}
+			if len(feed.Messages) < 200 || len(feed.Messages) > 300 {
+				errors <- fmt.Errorf("feed contains %d messages, want between 200 and 300", len(feed.Messages))
+			}
+		}()
+	}
+	close(start)
+	waitGroup.Wait()
+	<-appendDone
+	close(errors)
+	for err := range errors {
+		t.Error(err)
+	}
+
+	var finalFeed struct {
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(decodeGzipSnapshot(t, balancer.feed.snapshot())), &finalFeed); err != nil {
+		t.Fatalf("decode final feed: %v", err)
+	}
+	if len(finalFeed.Messages) != 300 {
+		t.Fatalf("final feed contains %d messages, want 300", len(finalFeed.Messages))
+	}
+}
+
+func decodeGzipSnapshot(t *testing.T, snapshot feedSnapshot) string {
+	t.Helper()
+	var compressed bytes.Buffer
+	if err := writeGzipFeed(&compressed, snapshot); err != nil {
+		t.Fatalf("write gzip snapshot: %v", err)
+	}
+	reader, err := gzip.NewReader(&compressed)
+	if err != nil {
+		t.Fatalf("open gzip snapshot: %v", err)
+	}
+	defer reader.Close()
+	payload, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read gzip snapshot: %v", err)
+	}
+	return string(payload)
 }
 
 func testConfig() config {
