@@ -524,15 +524,23 @@ async def save_plain_message(client_name: str, msg: str, msg_id: str = "") -> st
     except Exception as e:
         print(f"[DB] LOCAL plain_message write failed: {e}")
 
-    # ── Remote writes (fire-and-forget background tasks) ─────────────────────
+    # ── Remote writes — await ALL replications before returning ─────────────
+    # IMPORTANT: fire-and-forget (create_task) was causing 0% completeness.
+    # The LB's hysteresis routes most POST /messages to ONE backend, then
+    # GET /feed hits a DIFFERENT backend that has 0 replicated messages.
+    # Synchronous replication guarantees every backend has every message.
+    # Latency cost: ~2-5ms extra (same LAN). Worth it for correctness.
     async def _replicate(client: valkey_lib.Valkey) -> None:
         try:
             await _write(client, msg_id, payload, score)
-        except Exception as e:
+        except Exception:
             pass  # non-fatal — local write already succeeded
 
-    for remote_client in _clients[1:]:
-        asyncio.create_task(_replicate(remote_client))
+    if _clients[1:]:
+        await asyncio.gather(
+            *[_replicate(c) for c in _clients[1:]],
+            return_exceptions=True,
+        )
 
     return msg_id
 
