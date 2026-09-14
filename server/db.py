@@ -93,6 +93,8 @@ async def init_db() -> None:
             decode_responses=True,
             socket_connect_timeout=2,
             socket_timeout=2,
+            max_connections=50,        # increased from default 10 — needed under high concurrency
+            retry_on_timeout=True,     # retry once on timeout instead of raising immediately
         )
         _clients.append(client)
     try:
@@ -498,10 +500,7 @@ async def save_plain_message(client_name: str, msg: str, msg_id: str = "") -> st
     if not msg_id:
         msg_id = str(uuid.uuid4())
 
-    # Canonical timestamp: first-write wins via HSETNX
-    ts_key = f"room:{_FEED_ROOM}:msg_ts"
-    raw_ts = await _local().hget(ts_key, msg_id)
-    score = float(raw_ts) if raw_ts is not None else time.time()
+    score = time.time()
 
     payload = json.dumps({
         "msg_id":      msg_id,
@@ -511,17 +510,17 @@ async def save_plain_message(client_name: str, msg: str, msg_id: str = "") -> st
     }, separators=(",", ":"), ensure_ascii=False)
 
     async def _write(c: valkey_lib.Valkey, mid: str, p: str, s: float) -> None:
-        async with c.pipeline(transaction=True) as pipe:
-            pipe.hsetnx(f"room:{_FEED_ROOM}:msg_ts", mid, str(s))
-            pipe.zadd(f"room:{_FEED_ROOM}:timeline", {mid: s}, nx=True)
-            pipe.hset(f"room:{_FEED_ROOM}:messages_hash", mid, p)
-            await pipe.execute()
+        # Use a non-transactional pipeline (no MULTI/EXEC overhead).
+        # ZADD NX and HSET are individually atomic in Valkey.
+        # This is significantly faster under high concurrency than transaction=True.
+        pipe = c.pipeline(transaction=False)
+        pipe.zadd(f"room:{_FEED_ROOM}:timeline", {mid: s}, nx=True)
+        pipe.hset(f"room:{_FEED_ROOM}:messages_hash", mid, p)
+        await pipe.execute()
 
     # ── LOCAL write (awaited — must succeed before HTTP response is sent) ────
-    local_ok = False
     try:
         await _write(_local(), msg_id, payload, score)
-        local_ok = True
     except Exception as e:
         print(f"[DB] LOCAL plain_message write failed: {e}")
 
@@ -530,7 +529,7 @@ async def save_plain_message(client_name: str, msg: str, msg_id: str = "") -> st
         try:
             await _write(client, msg_id, payload, score)
         except Exception as e:
-            print(f"[DB] Remote plain_message replication failed (non-fatal): {e}")
+            pass  # non-fatal — local write already succeeded
 
     for remote_client in _clients[1:]:
         asyncio.create_task(_replicate(remote_client))

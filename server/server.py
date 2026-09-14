@@ -649,7 +649,7 @@ async def post_message(request: Request):
 # ── Short-lived feed cache ────────────────────────────────────────────────────
 # Collapses concurrent GET /feed bursts into a single Valkey read.
 _feed_cache: dict = {"ts": 0.0, "data": None}
-_FEED_CACHE_TTL_S: float = 0.10   # 100 ms
+_FEED_CACHE_TTL_S: float = 0.20   # 200 ms
 
 
 @app.get("/feed")
@@ -662,22 +662,25 @@ async def get_feed(limit: int = 0):
     limit=0 (default) — returns ALL messages (needed for completeness check).
     limit=N — returns last N messages.
 
-    Cached in-process for 100 ms to absorb concurrent bursts.
-    Served from LOCAL Valkey — in-memory, sub-millisecond base latency.
+    Cached in-process for 200 ms to absorb concurrent bursts.
+    IMPORTANT: empty results are never served from cache — always re-fetch
+    to avoid returning stale 0-message responses during/after load tests.
     """
     import time as _time
 
     now = _time.monotonic()
+    cached = _feed_cache["data"]
+    # Only use cache if: not expired AND has actual messages (non-empty)
     if (
-        _feed_cache["data"] is not None
+        cached is not None
+        and len(cached) > 0
         and (now - _feed_cache["ts"]) < _FEED_CACHE_TTL_S
     ):
-        cached = _feed_cache["data"]
         if limit > 0:
             return {"messages": cached[-limit:], "count": min(len(cached), limit)}
         return {"messages": cached, "count": len(cached)}
 
-    # Cache miss — fetch ALL from Valkey
+    # Cache miss or empty — fetch ALL from all Valkey nodes
     messages = await db.get_feed(limit=0)
     _feed_cache["data"] = messages
     _feed_cache["ts"] = now
