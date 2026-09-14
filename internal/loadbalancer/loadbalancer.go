@@ -3,6 +3,7 @@ package loadbalancer
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -27,10 +28,23 @@ import (
 )
 
 const (
-	affinityCookieName = "pixelchat_backend"
-	feedJSONPrefix     = `{"messages":[`
-	feedJSONSuffix     = `]}`
+	affinityCookieName         = "pixelchat_backend"
+	feedJSONPrefix             = `{"messages":[`
+	feedJSONSuffix             = `]}`
+	maxConcurrentFeedResponses = 16
+	serverReadBufferBytes      = 16 << 10
+	serverWriteBufferBytes     = 32 << 10
 )
+
+var feedGzipWriters = sync.Pool{
+	New: func() any {
+		writer, err := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
+		if err != nil {
+			panic(err)
+		}
+		return writer
+	},
+}
 
 type Backend struct {
 	ID       int
@@ -152,6 +166,7 @@ type LoadBalancer struct {
 	logger          *log.Logger
 	loadThreshold   int64
 	feed            *feedStore
+	feedResponses   chan struct{}
 	messageSequence atomic.Uint64
 }
 
@@ -425,18 +440,82 @@ func (lb *LoadBalancer) handleFeed(response http.ResponseWriter, request *http.R
 
 	start := time.Now()
 	lb.metrics.Total.Add(1)
+	if request.Method == http.MethodGet {
+		select {
+		case lb.feedResponses <- struct{}{}:
+			defer func() { <-lb.feedResponses }()
+		case <-request.Context().Done():
+			lb.metrics.Failed.Add(1)
+			lb.metrics.latencies.observe(time.Since(start))
+			return
+		}
+	}
+
 	messages := lb.feed.snapshot()
 	contentLength := len(feedJSONPrefix) + len(messages) + len(feedJSONSuffix)
 	response.Header().Set("Content-Type", "application/json")
-	response.Header().Set("Content-Length", strconv.Itoa(contentLength))
-	response.WriteHeader(http.StatusOK)
-	if request.Method == http.MethodGet {
-		_, _ = io.WriteString(response, feedJSONPrefix)
-		_, _ = response.Write(messages)
-		_, _ = io.WriteString(response, feedJSONSuffix)
+	response.Header().Set("Vary", "Accept-Encoding")
+
+	var writeError error
+	if request.Method == http.MethodGet && acceptsGzip(request.Header.Get("Accept-Encoding")) {
+		response.Header().Set("Content-Encoding", "gzip")
+		response.WriteHeader(http.StatusOK)
+		writeError = writeGzipFeed(response, messages)
+	} else {
+		response.Header().Set("Content-Length", strconv.Itoa(contentLength))
+		response.WriteHeader(http.StatusOK)
+		if request.Method == http.MethodGet {
+			if _, err := io.WriteString(response, feedJSONPrefix); err != nil {
+				writeError = err
+			} else if _, err := response.Write(messages); err != nil {
+				writeError = err
+			} else if _, err := io.WriteString(response, feedJSONSuffix); err != nil {
+				writeError = err
+			}
+		}
 	}
-	lb.metrics.Success.Add(1)
+	if writeError == nil {
+		lb.metrics.Success.Add(1)
+	} else {
+		lb.metrics.Failed.Add(1)
+	}
 	lb.metrics.latencies.observe(time.Since(start))
+}
+
+func acceptsGzip(header string) bool {
+	for _, encoding := range strings.Split(header, ",") {
+		parts := strings.Split(encoding, ";")
+		if !strings.EqualFold(strings.TrimSpace(parts[0]), "gzip") {
+			continue
+		}
+		quality := 1.0
+		for _, parameter := range parts[1:] {
+			name, value, found := strings.Cut(parameter, "=")
+			if !found || !strings.EqualFold(strings.TrimSpace(name), "q") {
+				continue
+			}
+			parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+			if err != nil {
+				quality = 0
+			} else {
+				quality = parsed
+			}
+		}
+		return quality > 0
+	}
+	return false
+}
+
+func writeGzipFeed(response io.Writer, messages []byte) error {
+	writer := feedGzipWriters.Get().(*gzip.Writer)
+	writer.Reset(response)
+	_, prefixError := io.WriteString(writer, feedJSONPrefix)
+	_, messagesError := writer.Write(messages)
+	_, suffixError := io.WriteString(writer, feedJSONSuffix)
+	closeError := writer.Close()
+	writer.Reset(io.Discard)
+	feedGzipWriters.Put(writer)
+	return errors.Join(prefixError, messagesError, suffixError, closeError)
 }
 
 func (lb *LoadBalancer) handleClear(response http.ResponseWriter, request *http.Request) {
@@ -777,6 +856,7 @@ func newLoadBalancer(configuration config, backends []*Backend, logger *log.Logg
 		logger:         logger,
 		loadThreshold:  int64(configuration.loadThreshold),
 		feed:           newFeedStore(4 << 20),
+		feedResponses:  make(chan struct{}, maxConcurrentFeedResponses),
 	}
 }
 
@@ -824,6 +904,13 @@ func RunCLI(arguments []string, standardOutput io.Writer, standardError io.Write
 		Handler:           balancer.handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       2 * time.Second,
+		ConnContext: func(ctx context.Context, connection net.Conn) context.Context {
+			if tcpConnection, ok := connection.(*net.TCPConn); ok {
+				_ = tcpConnection.SetReadBuffer(serverReadBufferBytes)
+				_ = tcpConnection.SetWriteBuffer(serverWriteBufferBytes)
+			}
+			return ctx
+		},
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

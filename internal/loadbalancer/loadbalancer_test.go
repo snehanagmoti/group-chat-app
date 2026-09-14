@@ -3,6 +3,7 @@ package loadbalancer
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -116,7 +117,7 @@ func TestLab6ClearAndValidation(t *testing.T) {
 	}
 }
 
-func TestLab6FeedAlwaysReturnsPlainJSON(t *testing.T) {
+func TestLab6FeedUsesGzipWhenAccepted(t *testing.T) {
 	balancer := testBalancer(t, "http://one.test", nil)
 	server := httptest.NewServer(balancer.handler())
 	defer server.Close()
@@ -132,10 +133,15 @@ func TestLab6FeedAlwaysReturnsPlainJSON(t *testing.T) {
 		t.Fatalf("GET /feed: %v", err)
 	}
 	defer response.Body.Close()
-	if encoding := response.Header.Get("Content-Encoding"); encoding != "" {
-		t.Fatalf("Content-Encoding = %q, want plain JSON", encoding)
+	if encoding := response.Header.Get("Content-Encoding"); encoding != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", encoding)
 	}
-	feedBody, err := io.ReadAll(response.Body)
+	reader, err := gzip.NewReader(response.Body)
+	if err != nil {
+		t.Fatalf("open gzip feed: %v", err)
+	}
+	defer reader.Close()
+	feedBody, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatalf("read feed: %v", err)
 	}
