@@ -33,17 +33,17 @@ const (
 	affinityCookieName         = "pixelchat_backend"
 	feedJSONPrefix             = `{"messages":[`
 	feedJSONSuffix             = `]}`
-	maxConcurrentFeedResponses = 256
+	maxConcurrentFeedResponses = 32
 	feedCompressionBatchBytes  = 32 << 10
-	serverReadBufferBytes      = 16 << 10
-	serverWriteBufferBytes     = 32 << 10
+	serverReadBufferBytes      = 8 << 10
+	serverWriteBufferBytes     = 16 << 10
 )
 
 var (
 	feedJSONPrefixBytes    = []byte(feedJSONPrefix)
 	feedJSONSuffixBytes    = []byte(feedJSONSuffix)
 	feedJSONSeparatorBytes = []byte{','}
-	feedGzipHeader         = []byte{0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0xff}
+	feedGzipHeader         = []byte{0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff}
 )
 
 type Backend struct {
@@ -161,7 +161,7 @@ func newFeedGeneration(dataCapacity int) *feedGeneration {
 		crc:              crc32.Update(0, crc32.IEEETable, feedJSONPrefixBytes),
 		uncompressedSize: uint32(len(feedJSONPrefixBytes)),
 	}
-	compressor, err := flate.NewWriter(sliceAppender{target: &generation.compressed}, flate.BestSpeed)
+	compressor, err := flate.NewWriter(sliceAppender{target: &generation.compressed}, flate.DefaultCompression)
 	if err != nil {
 		panic(fmt.Sprintf("create feed compressor: %v", err))
 	}
@@ -1010,8 +1010,8 @@ func RunCLI(arguments []string, standardOutput io.Writer, standardError io.Write
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", configuration.port),
 		Handler:           balancer.handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       2 * time.Second,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       15 * time.Second,
 		ConnContext: func(ctx context.Context, connection net.Conn) context.Context {
 			if tcpConnection, ok := connection.(*net.TCPConn); ok {
 				_ = tcpConnection.SetReadBuffer(serverReadBufferBytes)
