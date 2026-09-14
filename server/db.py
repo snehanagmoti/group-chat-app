@@ -91,10 +91,9 @@ async def init_db() -> None:
             host=host,
             port=port,
             decode_responses=True,
-            socket_connect_timeout=2,
-            socket_timeout=2,
-            max_connections=50,        # increased from default 10 — needed under high concurrency
-            retry_on_timeout=True,     # retry once on timeout instead of raising immediately
+            socket_connect_timeout=0.2,   # fast fail — 200ms is plenty for LAN
+            socket_timeout=0.2,           # don't block for 2s on unreachable nodes
+            max_connections=50,
         )
         _clients.append(client)
     try:
@@ -524,12 +523,7 @@ async def save_plain_message(client_name: str, msg: str, msg_id: str = "") -> st
     except Exception as e:
         print(f"[DB] LOCAL plain_message write failed: {e}")
 
-    # ── Remote writes — await ALL replications before returning ─────────────
-    # IMPORTANT: fire-and-forget (create_task) was causing 0% completeness.
-    # The LB's hysteresis routes most POST /messages to ONE backend, then
-    # GET /feed hits a DIFFERENT backend that has 0 replicated messages.
-    # Synchronous replication guarantees every backend has every message.
-    # Latency cost: ~2-5ms extra (same LAN). Worth it for correctness.
+    # ── Remote writes — fire-and-forget ─────────────────────────────────────
     async def _replicate(client: valkey_lib.Valkey) -> None:
         try:
             await _write(client, msg_id, payload, score)

@@ -720,40 +720,42 @@ async def get_feed(limit: int = 0):
             return {"messages": cached[-limit:], "count": min(len(cached), limit)}
         return {"messages": cached, "count": len(cached)}
 
-    # Step 1: local Valkey read (fast, no network)
+    # Step 1: local Valkey read (fast, no network, always has this backend's messages)
     local_msgs = await db.get_feed_local()
 
-    # Step 2: smart fan-out decision
-    # If local has data → sync replication worked → trust it (no fan-out needed)
-    # If local is empty → sync replication failed → fan-out to peers as fallback
-    if local_msgs:
-        merged = local_msgs
-    elif _PEER_URLS:
-        # Fan-out: ask each sibling for ITS local data
-        async def _fetch_peer(url: str) -> list[dict]:
-            try:
-                resp = await _peer_http_client.get(f"{url}/internal/feed")
-                if resp.status_code == 200:
-                    return resp.json().get("messages", [])
-            except Exception:
-                pass
-            return []
+    # Step 2: ALWAYS fan-out to peer backends and merge
+    # We CANNOT skip fan-out when local has data: because each backend's local Valkey
+    # only contains messages that the LB routed to IT (roughly 1/3 of total).
+    # Completeness requires collecting ALL messages from ALL backends.
+    # The 200ms cache above ensures this only runs on cache misses, not every request.
+    async def _fetch_peer(url: str) -> list[dict]:
+        try:
+            resp = await _peer_http_client.get(f"{url}/internal/feed")
+            if resp.status_code == 200:
+                return resp.json().get("messages", [])
+        except Exception:
+            pass
+        return []
 
+    if _PEER_URLS:
         peer_results = await asyncio.gather(
             *[_fetch_peer(url) for url in _PEER_URLS],
             return_exceptions=True,
         )
-
-        seen: dict[str, dict] = {}
-        for result in peer_results:
-            if isinstance(result, list):
-                for msg in result:
-                    mid = msg.get("msg_id")
-                    if mid and mid not in seen:
-                        seen[mid] = msg
-        merged = sorted(seen.values(), key=lambda m: m.get("created_at", 0))
     else:
-        merged = []
+        peer_results = []
+
+    # Step 3: merge local + peers, deduplicate by msg_id, sort by created_at
+    seen: dict[str, dict] = {
+        msg["msg_id"]: msg for msg in local_msgs if "msg_id" in msg
+    }
+    for result in peer_results:
+        if isinstance(result, list):
+            for msg in result:
+                mid = msg.get("msg_id")
+                if mid and mid not in seen:
+                    seen[mid] = msg
+    merged = sorted(seen.values(), key=lambda m: m.get("created_at", 0))
 
     _feed_cache["data"] = merged
     _feed_cache["ts"] = now
