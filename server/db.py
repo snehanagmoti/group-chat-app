@@ -545,6 +545,31 @@ async def save_plain_message(client_name: str, msg: str, msg_id: str = "") -> st
     return msg_id
 
 
+async def get_feed_local() -> list[dict]:
+    """
+    Read messages from LOCAL Valkey ONLY — no fan-out to siblings.
+    Used by /internal/feed so peer backends can fetch our local data.
+    """
+    if not _clients:
+        return []
+    try:
+        msg_ids = await _local().zrange(f"room:{_FEED_ROOM}:timeline", 0, -1)
+        if not msg_ids:
+            return []
+        raw_list = await _local().hmget(f"room:{_FEED_ROOM}:messages_hash", *msg_ids)
+        result = []
+        for raw in raw_list:
+            if raw:
+                try:
+                    result.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    pass
+        return result
+    except Exception as e:
+        print(f"[DB] get_feed_local error: {e}")
+        return []
+
+
 async def get_feed(limit: int = 0) -> list[dict]:
     """
     Retrieve plain-text messages for the GET /feed endpoint.

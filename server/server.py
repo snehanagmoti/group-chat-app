@@ -646,10 +646,43 @@ async def post_message(request: Request):
     }
 
 
+# ── Peer backend HTTP fan-out for GET /feed ──────────────────────────────────
+# Derive sibling backend HTTP URLs from VALKEY_HOSTS env var.
+# VALKEY_HOSTS = "127.0.0.1:4000,172.17.0.96:4000,172.17.0.97:4000"
+# → skip 127.0.0.1 (self), derive http://172.17.0.96:3000 etc.
+# This lets GET /feed work even when cross-machine Valkey is not accessible
+# (e.g. Valkey bound to 127.0.0.1). Backend-to-backend HTTP is always routable.
+
+def _derive_peer_urls() -> list[str]:
+    raw = os.environ.get("VALKEY_HOSTS", "")
+    backend_port = int(os.environ.get("BACKEND_PORT", "3000"))
+    peers = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        host = entry.rsplit(":", 1)[0]
+        if host in ("127.0.0.1", "localhost", "::1"):
+            continue  # skip self
+        peers.append(f"http://{host}:{backend_port}")
+    return peers
+
+_PEER_URLS: list[str] = _derive_peer_urls()
+
 # ── Short-lived feed cache ────────────────────────────────────────────────────
-# Collapses concurrent GET /feed bursts into a single Valkey read.
 _feed_cache: dict = {"ts": 0.0, "data": None}
 _FEED_CACHE_TTL_S: float = 0.20   # 200 ms
+
+
+@app.get("/internal/feed")
+async def internal_feed_local():
+    """
+    Returns messages from LOCAL Valkey ONLY — no fan-out.
+    Called by sibling backends when serving GET /feed to aggregate all data.
+    NEVER call /internal/feed from here (would cause infinite loops).
+    """
+    messages = await db.get_feed_local()
+    return {"messages": messages, "count": len(messages)}
 
 
 @app.get("/feed")
@@ -657,20 +690,21 @@ async def get_feed(limit: int = 0):
     """
     GET /feed — Required by the assignment evaluator.
 
-    Returns messages submitted via POST /message in chronological order.
+    Returns messages from ALL backends merged together.
+    Strategy:
+      1. Read from LOCAL Valkey (fast, always works)
+      2. Fan-out HTTP GET /internal/feed to all sibling backends in parallel
+      3. Merge all results by msg_id, sort by created_at
 
-    limit=0 (default) — returns ALL messages (needed for completeness check).
-    limit=N — returns last N messages.
-
-    Cached in-process for 200 ms to absorb concurrent bursts.
-    IMPORTANT: empty results are never served from cache — always re-fetch
-    to avoid returning stale 0-message responses during/after load tests.
+    This works even when cross-machine Valkey is not accessible, because
+    backend-to-backend HTTP is always routable on the LAN.
     """
     import time as _time
+    import httpx
 
     now = _time.monotonic()
     cached = _feed_cache["data"]
-    # Only use cache if: not expired AND has actual messages (non-empty)
+    # Only use cache if not expired AND has actual messages
     if (
         cached is not None
         and len(cached) > 0
@@ -680,14 +714,48 @@ async def get_feed(limit: int = 0):
             return {"messages": cached[-limit:], "count": min(len(cached), limit)}
         return {"messages": cached, "count": len(cached)}
 
-    # Cache miss or empty — fetch ALL from all Valkey nodes
-    messages = await db.get_feed(limit=0)
-    _feed_cache["data"] = messages
+    # Step 1: local Valkey read
+    local_msgs = await db.get_feed_local()
+
+    # Step 2: fan-out to sibling backends via HTTP
+    async def _fetch_peer(url: str) -> list[dict]:
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                resp = await client.get(f"{url}/internal/feed")
+                if resp.status_code == 200:
+                    return resp.json().get("messages", [])
+        except Exception:
+            pass
+        return []
+
+    if _PEER_URLS:
+        peer_results = await asyncio.gather(
+            *[_fetch_peer(url) for url in _PEER_URLS],
+            return_exceptions=True,
+        )
+    else:
+        peer_results = []
+
+    # Step 3: merge and deduplicate by msg_id
+    seen: dict[str, dict] = {}
+    for msg in local_msgs:
+        mid = msg.get("msg_id")
+        if mid:
+            seen[mid] = msg
+    for result in peer_results:
+        if isinstance(result, list):
+            for msg in result:
+                mid = msg.get("msg_id")
+                if mid and mid not in seen:
+                    seen[mid] = msg
+
+    merged = sorted(seen.values(), key=lambda m: m.get("created_at", 0))
+    _feed_cache["data"] = merged
     _feed_cache["ts"] = now
 
     if limit > 0:
-        return {"messages": messages[-limit:], "count": min(len(messages), limit)}
-    return {"messages": messages, "count": len(messages)}
+        return {"messages": merged[-limit:], "count": min(len(merged), limit)}
+    return {"messages": merged, "count": len(merged)}
 
 
 # ── Reconciliation endpoints (partial fan-out recovery) ────────────────────────
